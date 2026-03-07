@@ -2,17 +2,17 @@
 
 ## Preview
 **Console:**  
-![.](https://github.com/DeveloperEclipse/Bookmarklet-Dev-Tools/blob/main/assets/1.jpeg?raw=true)
+![.](https://github.com/DeveloperExotic/Bookmarklet-Dev-Tools/blob/main/assets/1.jpeg?raw=true)
 **Elements:**  
-![.](https://github.com/DeveloperEclipse/Bookmarklet-Dev-Tools/blob/main/assets/2.jpeg?raw=true)
+![.](https://github.com/DeveloperExotic/Bookmarklet-Dev-Tools/blob/main/assets/2.jpeg?raw=true)
 **Network:**  
-![.](https://github.com/DeveloperEclipse/Bookmarklet-Dev-Tools/blob/main/assets/3.jpeg?raw=true)
+![.](https://github.com/DeveloperExotic/Bookmarklet-Dev-Tools/blob/main/assets/3.jpeg?raw=true)
 **Sources:**  
-![.](https://github.com/DeveloperEclipse/Bookmarklet-Dev-Tools/blob/main/assets/4.jpeg?raw=true)
+![.](https://github.com/DeveloperExotic/Bookmarklet-Dev-Tools/blob/main/assets/4.jpeg?raw=true)
 **Settings:**  
-![.](https://github.com/DeveloperEclipse/Bookmarklet-Dev-Tools/blob/main/assets/5.jpeg?raw=true)
+![.](https://github.com/DeveloperExotic/Bookmarklet-Dev-Tools/blob/main/assets/5.jpeg?raw=true)
 **Plugins:**  
-![.](https://github.com/DeveloperEclipse/Bookmarklet-Dev-Tools/blob/main/assets/6.jpeg?raw=true)
+![.](https://github.com/DeveloperExotic/Bookmarklet-Dev-Tools/blob/main/assets/6.jpeg?raw=true)
 ===============
 ## Features
 - **Console** – Log, warn, error, info, table, groups, and execute JavaScript with autocomplete and command history.
