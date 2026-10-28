@@ -16,9 +16,11 @@
 <div style="height:400px">spacer (page must stay finger-scrollable)</div>
 <script>
 (function(){
-  /* Pass ?src=<url> to test any build (local file for pre-push, CDN after). */
+  /* Pass ?src=<url> to test any build (local file for pre-push, CDN after).
+   * Default: the tag-pinned CDN URL — the exact artifact the install
+   * bookmarklet loads (tags are immutable, CDN caches can never go stale). */
   var QS = new URLSearchParams(location.search);
-  var SRC = QS.get('src') || 'https://cdn.jsdelivr.net/gh/shalosi00/Bookmarklet-Dev-Tools@main/src.js';
+  var SRC = QS.get('src') || 'https://cdn.jsdelivr.net/gh/shalosi00/Bookmarklet-Dev-Tools@v5.3.1/src.js';
 
   var R = [], pageErrors = [];
   window.addEventListener('error', function(e){ pageErrors.push(String(e.message||e)); });

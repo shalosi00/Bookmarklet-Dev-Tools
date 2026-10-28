@@ -14,10 +14,14 @@ It ships in **two editions** from the same source:
 | **Userscript** | `pocket-devtools.user.js` | Always-on dev tools that **survive page refresh** |
 
 ```
-javascript:(function(){if(window.__POCKET_DEVTOOLS__){window.__POCKET_DEVTOOLS__.toggle();return}var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/gh/shalosi00/Bookmarklet-Dev-Tools@main/src.js';s.onerror=function(){alert('Pocket DevTools failed to load (offline or CSP-blocked)')};(document.head||document.documentElement).appendChild(s);})();
+javascript:(function(){if(window.__POCKET_DEVTOOLS__){window.__POCKET_DEVTOOLS__.toggle();return}var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/gh/shalosi00/Bookmarklet-Dev-Tools@v5.3.1/src.js';s.onerror=function(){alert('Pocket DevTools failed to load (offline or CSP-blocked)')};(document.head||document.documentElement).appendChild(s);})();
 ```
 
 (Tapping the bookmarklet again toggles the panel — it no longer needs to reload the script.)
+
+The URL is pinned to the release tag (`@v5.3.1`), so you always get the exact build listed below — CDN
+caches for tags never go stale. To always track the latest commit instead, replace `@v5.3.1` with
+`@main` (jsDelivr may serve branch updates with a short cache delay after each release).
 
 ## Install — Firefox for Android
 
@@ -102,6 +106,8 @@ pdt                  // the public API object
 - Verified with **155 automated end-to-end checks** (v5.3's 154 + new keyboard-activation
   regression check) plus a live-CDN smoke suite (`test/livesmoke.html`, 27 checks) that boots the
   exact jsDelivr artifact and audits button visibility per panel across all three themes
+- Released as the immutable tag **`v5.3.1`** — the install bookmarklet is pinned to it so CDN
+  caches can never serve a stale mix
 
 ## What's new in v5.3 — touch & visibility fixes (Android Firefox)
 
