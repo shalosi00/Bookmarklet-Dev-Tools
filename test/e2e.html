@@ -95,7 +95,7 @@
     window.__CHAIN = Promise.resolve();
 
     /* ---------- A. boot & UI ---------- */
-    T('A1 api exposed', function () { return P.version === '5.3.0' || 'version=' + P.version; });
+    T('A1 api exposed', function () { return P.version === '5.3.1' || 'version=' + P.version; });
     T('A3 open sheet', function () {
       P.open();
       return P._app().classList.contains('sheet-open') || 'no sheet-open class';

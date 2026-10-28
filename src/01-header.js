@@ -15,7 +15,7 @@
     return;
   }
 
-  var VERSION = '5.3.0';
+  var VERSION = '5.3.1';
 
   /* Build flavour. The userscript edition (pocket-devtools.user.js) sets this
    * flag right before the core runs: capture starts at document-start and the

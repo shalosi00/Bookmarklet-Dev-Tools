@@ -94,6 +94,15 @@ getListeners(el)     // captured listeners     monitorEvents(el, [types])
 pdt                  // the public API object
 ```
 
+## What's new in v5.3.1 — keyboard-closable floating icon
+
+- The FAB's red **×** badge now also hides the icon when activated by **keyboard** (Enter/Space on
+  the focused button) — previously only pointer taps worked; a following synthetic click can no
+  longer double-fire the hide toast
+- Verified with **155 automated end-to-end checks** (v5.3's 154 + new keyboard-activation
+  regression check) plus a live-CDN smoke suite (`test/livesmoke.html`, 27 checks) that boots the
+  exact jsDelivr artifact and audits button visibility per panel across all three themes
+
 ## What's new in v5.3 — touch & visibility fixes (Android Firefox)
 
 - **Every button is now visible**: icon buttons (pause, blocker, HAR, clear, inspect, close …)
@@ -110,9 +119,10 @@ pdt                  // the public API object
   it on click events, which could eat taps); `touchcancel` is handled during element picking
 - **Snappier taps**: `touch-action: manipulation` on all controls (no 300 ms delay /
   double-tap-zoom interference), bigger grabber (32 px) and head buttons (38 px)
-- Verified with **154 automated end-to-end checks** (previous 125 + 29 new touch/visibility
-  regression checks in `test/e2e5.html`) and a real-touch gesture suite (flick-close, tap-to
-  maximize, finger-scroll in every panel, badge hide/restore, destroy + re-inject cycle)
+- Verified with **155 automated end-to-end checks** (previous 125 + 29 touch/visibility
+  regression checks in `test/e2e5.html` + v5.3.1 keyboard check) and a real-touch gesture suite
+  (flick-close, tap-to maximize, finger-scroll in every panel, badge hide/restore,
+  destroy + re-inject cycle)
 
 ## What's new in v5.2 — maximum stability
 

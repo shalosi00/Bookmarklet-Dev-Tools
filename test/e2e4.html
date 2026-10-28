@@ -81,7 +81,7 @@
     window.__CHAIN = Promise.resolve();
 
     /* ================= A. boot ================= */
-    T('A1 version 5.3.0', function () { return P.version === '5.3.0' || 'v=' + P.version; });
+    T('A1 version 5.3.1', function () { return P.version === '5.3.1' || 'v=' + P.version; });
     T('A2 single host element', function () {
       return document.querySelectorAll('#pdt-host').length === 1 || 'hosts=' + document.querySelectorAll('#pdt-host').length;
     });
@@ -306,7 +306,7 @@
       return sleep(400).then(function () {
         var P2 = window.__POCKET_DEVTOOLS__;
         if (!P2) return 'no api after re-inject';
-        if (P2.version !== '5.3.0') return 'v=' + P2.version;
+        if (P2.version !== '5.3.1') return 'v=' + P2.version;
         if (!document.querySelector('#pdt-host')) return 'no host';
         P = P2;   /* the harness helpers now target the fresh instance */
         P2.tab('console');

@@ -19,7 +19,7 @@ window.addEventListener('load', function () {
     function t(name, ok, info) { R.push({ name: name, ok: !!ok, info: info || '' }); }
     t('artifact parses and boots', !!P, 'api=' + !!P);
     t('edition = userscript (header flag works)', P && P.edition === 'userscript', 'ed=' + (P && P.edition));
-    t('version 5.3.0', P && P.version === '5.3.0', 'v=' + (P && P.version));
+    t('version 5.3.1', P && P.version === '5.3.1', 'v=' + (P && P.version));
     var open = false;
     try { open = P._app().classList.contains('sheet-open'); } catch (e) { /* noop */ }
     t('background mode (no auto-open)', P && !open, 'open=' + open);

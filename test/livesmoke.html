@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pocket DevTools v5.3.1 — LIVE CDN smoke test v3</title>
+<style>
+  body{font:13px/1.5 monospace;margin:0;padding:16px;padding-bottom:2000px;background:#fff;color:#111}
+  #out{white-space:pre-wrap}
+  .ok{color:#0a7d24}.bad{color:#c62828;background:#ffebee;padding:1px 4px}
+  .hdr{font-weight:bold;font-size:15px;margin-top:14px}
+</style>
+</head>
+<body>
+<div id="out">loading live CDN build...</div>
+<div style="height:400px">spacer (page must stay finger-scrollable)</div>
+<script>
+(function(){
+  /* Pass ?src=<url> to test any build (local file for pre-push, CDN after). */
+  var QS = new URLSearchParams(location.search);
+  var SRC = QS.get('src') || 'https://cdn.jsdelivr.net/gh/shalosi00/Bookmarklet-Dev-Tools@main/src.js';
+
+  var R = [], pageErrors = [];
+  window.addEventListener('error', function(e){ pageErrors.push(String(e.message||e)); });
+  window.addEventListener('unhandledrejection', function(e){ pageErrors.push('rejection:'+(e.reason&&e.reason.message||e.reason)); });
+
+  function chk(name, cond, info){ R.push({n:name, ok:!!cond, i:info||''}); }
+  function el(q,r){ return (r||document).querySelector(q); }
+  function els(q,r){ return Array.prototype.slice.call((r||document).querySelectorAll(q)); }
+  function visible(elm){
+    if(!elm) return false;
+    var r = elm.getBoundingClientRect(), cs = getComputedStyle(elm);
+    return r.width>0 && r.height>0 && cs.display!=='none' && cs.visibility!=='hidden';
+  }
+  function ptr(elm, type){
+    var r = elm.getBoundingClientRect();
+    var ev = new PointerEvent(type, {
+      bubbles: true, cancelable: true, composed: true,
+      clientX: r.left + r.width/2, clientY: r.top + r.height/2,
+      pointerId: 1, pointerType: 'touch', isPrimary: true
+    });
+    elm.dispatchEvent(ev);
+  }
+  window.__SMOKE_DONE__ = false;
+
+  function paint(){
+    var o = el('#out'), pass = 0, total = R.length, bad = [];
+    var label = SRC.indexOf('localhost') >= 0 ? 'LOCAL BUILD' : 'LIVE CDN';
+    R.forEach(function(x){ if(x.ok) pass++; else bad.push(x.n+(x.i?' ['+x.i+']':'')); });
+    o.innerHTML = '<div class="hdr">SMOKE (' + label + ') — ' + pass + '/' + total + ' passed</div>' +
+      R.map(function(x){
+        return (x.ok ? '<span class="ok">PASS</span> ' : '<span class="bad">FAIL</span> ') + x.n + (x.i ? ' — ' + x.i : '');
+      }).join('\n') +
+      (pageErrors.length ? '\n<span class="bad">PAGE ERRORS: ' + pageErrors.join(' | ') + '</span>' : '\npage errors: none');
+    window.__SMOKE_DONE__ = true;
+    window.__SMOKE_PASS__ = pass; window.__SMOKE_TOTAL__ = total; window.__SMOKE_BAD__ = bad;
+  }
+
+  function main(){
+    var P = window.__POCKET_DEVTOOLS__;
+    chk('A1 boot', !!P, P ? 'edition: ' + P.edition : 'no API');
+    chk('A2 version 5.3.1', P && P.version === '5.3.1', P && P.version);
+
+    var app = P._app();
+    chk('B1 UI mounted (closed shadow DOM)', !!app, app ? '#pdt-host: ' + (el('#pdt-host') ? 'present' : 'n/a') : 'not mounted');
+
+    P.open();
+    chk('C1 sheet opens', app.classList.contains('sheet-open'));
+
+    var tabs = els('.pdt-tab', app);
+    chk('C2 tabs present', tabs.length >= 12, tabs.length + ' tabs');
+    tabs.forEach(function(t){ try{ t.click(); }catch(e){} });
+    var panels = els('.pdt-panel', app);
+    chk('C3 every tab renders a panel', panels.length >= 12, panels.length + ' panels');
+
+    /* ---- FIX 1: per-panel visibility audit across all 3 themes ---- */
+    P.tab('settings');
+    var cards = els('.pdt-themecard', app);
+    chk('FIX1a theme cards present', cards.length >= 3, cards.length + ' cards');
+    var themeNames = ['dark','light','amoled'], invis = [], applied = [], audited = 0;
+    themeNames.forEach(function(th, ti){
+      var card = els('.pdt-themecard', app).filter(function(c){
+        var nm = el('.nm', c); return nm && nm.textContent.toLowerCase().indexOf(th) >= 0;
+      })[0] || cards[ti];
+      if(card){ try{ card.click(); }catch(e){} }
+      applied.push(app.dataset.theme);
+      /* audit every panel while it is the ACTIVE one, plus persistent chrome */
+      els('.pdt-tab', app).forEach(function(t){ try{ t.click(); }catch(e){} });
+      var scope = els('.pdt-sheet', app).concat([app]);
+      scope.forEach(function(sc){
+        els('.pdt-ib, .pdt-btn, .pdt-chip, .pdt-fab', sc).forEach(function(b, i){
+          /* skip buttons inside inactive panels — they are display:none by design */
+          var panel = b.closest ? b.closest('.pdt-panel') : null;
+          if(panel && !panel.classList.contains('on')) return;
+          if(sc.classList && sc.classList.contains('pdt-panel') && !sc.classList.contains('on')) return;
+          audited++;
+          var cs = getComputedStyle(b);
+          var transparent = /rgba?\(\s*0,\s*0,\s*0,\s*0\s*\)|^transparent$/i.test(cs.backgroundColor);
+          var hasBorder = parseFloat(cs.borderTopWidth) > 0;
+          var id = (b.className || '') + '#' + i;
+          if(!visible(b)) invis.push(th + ':' + id + '(zero-size)');
+          else if(b.classList.contains('pdt-ib') && transparent) invis.push(th + ':' + id + '(transparent)');
+          else if(b.classList.contains('pdt-ib') && !hasBorder) invis.push(th + ':' + id + '(no-border)');
+        });
+      });
+    });
+    chk('FIX1b buttons visible in all 3 themes (per-panel)', invis.length === 0,
+        invis.length ? invis.slice(0, 5).join(',') : audited + ' button instances audited across dark/light/amoled');
+    chk('FIX1c theme switching works', applied.join(',') === 'dark,light,amoled', 'applied: ' + applied.join(','));
+
+    /* ---- FIX 2: touch scrolling + gesture ergonomics ---- */
+    P.tab('console');
+    console.log.apply(console, Array.apply(null, {length: 60}).map(function(_, i){ return 'filler-' + i; }));
+    setTimeout(function(){ finish2(); }, 150);
+  }
+
+  function finish2(){
+    var P = window.__POCKET_DEVTOOLS__, app = P._app();
+    /* ---- FIX 2 (cont): the real scroll containers ---- */
+    var scrolls = els('.pdt-scroll, .pdt-clog, .pdt-viewer, .pdt-mbody', app);
+    var scrollOk = scrolls.filter(function(n){
+      var cs = getComputedStyle(n);
+      return /(auto|scroll)/.test(cs.overflowY) && n.scrollHeight > n.clientHeight;
+    });
+    var containOk = scrolls.filter(function(n){ return getComputedStyle(n).overscrollBehavior === 'contain'; });
+    chk('FIX2a content panels finger-scrollable', scrollOk.length > 0,
+        scrollOk.length + '/' + scrolls.length + ' overflowing scrollers (' +
+        scrollOk.slice(0,2).map(function(n){ return (n.className||'').toString().trim().split(' ')[0] + ' ' + n.scrollHeight + '/' + n.clientHeight; }).join(', ') + ')');
+    chk('FIX2a2 scroll chaining contained (overscroll-behavior)', containOk.length >= Math.min(1, scrolls.length),
+        containOk.length + '/' + scrolls.length + ' scrollers contain overscroll');
+    var ctl = els('.pdt-ib, .pdt-btn, .pdt-tab, .pdt-chip', app);
+    var taBad = ctl.filter(function(b){ return getComputedStyle(b).touchAction !== 'manipulation'; }).length;
+    chk('FIX2b touch-action:manipulation on controls', ctl.length > 0 && taBad === 0, taBad + '/' + ctl.length + ' missing');
+    var grab = el('.pdt-grab', app) || el('.pdt-handle', app);
+    var grabInfo = grab ? (getComputedStyle(grab).touchAction + ', h:' + grab.getBoundingClientRect().height + 'px') : 'not found';
+    chk('FIX2c drag handle present & sized', !!grab && grab.getBoundingClientRect().height >= 24, grabInfo);
+    chk('FIX2d host page scroll intact', document.documentElement.scrollHeight > window.innerHeight,
+        document.documentElement.scrollHeight + 'px doc > ' + window.innerHeight + 'px viewport');
+
+    /* ---- FIX 3: closable FAB ---- */
+    P.close();
+    var fab = el('.pdt-fab', app);
+    chk('FIX3a FAB visible with sheet closed', visible(fab));
+    var badge = el('.pdt-fabx', fab);
+    chk('FIX3b close badge exists on FAB', !!badge, badge ? 'present' : 'missing');
+    if(badge){
+      var bcs2 = getComputedStyle(badge);
+      chk('FIX3c badge opaque & visible', visible(badge) && !/rgba?\(\s*0,\s*0,\s*0,\s*0\s*\)|^transparent$/i.test(bcs2.backgroundColor),
+          'bg:' + bcs2.backgroundColor + ' ' + bcs2.width + 'x' + bcs2.height);
+      /* REAL touch sequence: pointerdown + pointerup (like a finger tap) */
+      ptr(badge, 'pointerdown'); ptr(badge, 'pointerup');
+      chk('FIX3d touch tap on badge hides FAB', !visible(el('.pdt-fab', app)), 'hidden for this page load');
+      /* the synthetic click that follows a real tap must NOT double-fire (toast once) — verify state stable */
+      ptr(badge, 'click');
+      chk('FIX3e follow-up click does not break state', !visible(el('.pdt-fab', app)));
+      P.showFab();
+      chk('FIX3f API showFab() restores', visible(el('.pdt-fab', app)));
+      /* keyboard path: click with NO preceding pointerup (Enter/Space on focused button) */
+      try{ badge.focus(); }catch(e){}
+      badge.click();
+      chk('FIX3g keyboard activation (click-only) hides FAB', !visible(el('.pdt-fab', app)), 'v5.3.1 fix');
+      P.showFab();
+      chk('FIX3h FAB restored', visible(el('.pdt-fab', app)));
+      /* FAB tap (not badge) still opens the sheet */
+      ptr(fab, 'pointerdown'); ptr(fab, 'pointerup');
+      chk('FIX3i FAB body tap opens sheet', app.classList.contains('sheet-open'));
+      P.close();
+      chk('FIX3j sheet closes again', !app.classList.contains('sheet-open'));
+    }
+    P.open(); P.tab('settings');
+    var setTxt = (els('.pdt-panel', app).filter(function(x){ return x.classList.contains('on'); })[0] || {}).textContent || '';
+    chk('FIX3k settings has permanent FAB switch', /floating|fab|icon/i.test(setTxt), setTxt.length + ' chars scanned');
+
+    console.log('smoke-mark', 123);
+    var ents = P.entries();
+    chk('D1 console capture live', ents && ents.some(function(x){ return JSON.stringify(x).indexOf('smoke-mark') >= 0; }), ents ? ents.length + ' entries' : 'none');
+    chk('D2 zero page errors during boot+tests', pageErrors.length === 0, pageErrors.length ? pageErrors.slice(0,3).join(' | ') : 'clean');
+
+    paint();
+  }
+
+  function run(){ try { main(); } catch(e){ R.push({n:'suite crashed', ok:false, i:String(e && (e.stack||e))}); paint(); } }
+
+  var s = document.createElement('script');
+  s.src = SRC + (SRC.indexOf('?') >= 0 ? '&' : '?') + 'cb=' + Date.now();
+  s.onerror = function(){ el('#out').textContent = 'LOAD FAILED: ' + SRC; window.__SMOKE_DONE__ = true; window.__SMOKE_TOTAL__ = 1; window.__SMOKE_PASS__ = 0; };
+  s.onload = function(){ setTimeout(run, 400); };
+  (document.head || document.documentElement).appendChild(s);
+})();
+</script>
+</body>
+</html>

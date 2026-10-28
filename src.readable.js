@@ -1,4 +1,4 @@
-/*! Pocket DevTools v5.3.0 | MIT | improved fork of DeveloperExotic/Bookmarklet-Dev-Tools */
+/*! Pocket DevTools v5.3.1 | MIT | improved fork of DeveloperExotic/Bookmarklet-Dev-Tools */
 /* ===== 01-header.js ===== */
 /*
  * Pocket DevTools v5.0 — mobile-first developer tools as a bookmarklet.
@@ -17,7 +17,7 @@
     return;
   }
 
-  var VERSION = '5.3.0';
+  var VERSION = '5.3.1';
 
   /* Build flavour. The userscript edition (pocket-devtools.user.js) sets this
    * flag right before the core runs: capture starts at document-start and the
@@ -1353,12 +1353,22 @@ function setupFabDrag() {
   /* --- close badge on the FAB: hides the icon until the next load --- */
   var fabX = h('button.pdt-fabx', { type: 'button', title: 'Hide floating icon', 'aria-label': 'Hide floating icon' });
   fabX.innerHTML = iconSvg('close', 11);
+  /* pointer path (touch/mouse) hides on pointerup; a tap then also fires a
+   * synthetic click — flag it so the hide+toast never runs twice. A click
+   * with NO preceding pointerup is keyboard activation (Enter/Space on the
+   * focused button), which must hide the icon too. */
+  var fabXPointer = false;
   fabX.addEventListener('pointerdown', function (e) { e.stopPropagation(); e.preventDefault(); });
   fabX.addEventListener('pointerup', function (e) {
     e.stopPropagation(); e.preventDefault();
+    fabXPointer = true;
     hideFab(true);
   });
-  fabX.addEventListener('click', function (e) { e.stopPropagation(); e.preventDefault(); });
+  fabX.addEventListener('click', function (e) {
+    e.stopPropagation(); e.preventDefault();
+    if (fabXPointer) { fabXPointer = false; return; }
+    hideFab(true);   /* keyboard activation (Enter/Space) */
+  });
   fabEl.appendChild(fabX);
 }
 

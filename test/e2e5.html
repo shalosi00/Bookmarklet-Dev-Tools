@@ -78,6 +78,14 @@
       badge.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       return (before !== 'none' && fab.style.display === 'none') || 'display=' + fab.style.display;
     });
+    T('A4b keyboard activation (click with no pointerup) hides the FAB too', function () {
+      /* v5.3.1: Enter/Space on the focused badge button fires ONLY click —
+       * the hide must work on that path as well. */
+      P.showFab();
+      var before = fab.style.display;
+      badge.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      return (before !== 'none' && fab.style.display === 'none') || 'display=' + fab.style.display;
+    });
     T('A5 sheet did NOT open from badge tap', function () { return !isOpen() || 'sheet opened'; });
     T('A6 API hideFab/showFab round-trip', function () {
       P.showFab();
