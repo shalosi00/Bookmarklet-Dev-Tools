@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDT e2e3 — userscript persistence</title>
+<!-- ================================================================
+  e2e3 — userscript-edition end-to-end suite (3 phases, driven by ?p=):
+
+  Phase A: core loads in <head> (document.readyState === 'loading',
+           no document.body) — simulates @run-at document-start.
+           Verifies deferred UI boot, background mode (no auto-open),
+           FAB presence, EARLY capture (console/error/fetch/uncaught
+           before DOM ready), session flag set/clear on open/close.
+
+  Phase B: page reloaded while the sheet was open — the sheet must
+           reopen by itself, last tab restored, fresh early capture.
+
+  Phase C: host added to the exclusion list — zero code must run
+           (no API object, native fetch untouched).
+
+  Results accumulate in sessionStorage and are rendered in phase C.
+================================================================= -->
+<script>
+window.__PDT_USERSCRIPT__ = true;
+/* Phase C needs the exclusion list in place BEFORE the core evaluates.
+ * (Writing it here — before src.js — also makes it immune to the previous
+ * page's pagehide settings-flush, which lands before this script runs.) */
+if (/[?&]p=C/.test(location.search)) {
+  var __s = {};
+  try { __s = JSON.parse(localStorage.getItem('pdt:settings')) || {}; } catch (e) { __s = {}; }
+  __s.usExcluded = location.hostname || 'localhost';
+  localStorage.setItem('pdt:settings', JSON.stringify(__s));
+}
+</script>
+<script src="../src.js?v=51r3"></script>
+<script>
+  /* Runs immediately after the core — document still loading, UI must
+   * not exist yet. Emit traffic that only document-start hooks catch. */
+  window.__EARLY__ = {
+    readyState: document.readyState,
+    hadBody: !!document.body,
+    booted: !!document.getElementById('pdt-host') /* UI host = real boot probe */
+  };
+  console.log('EARLYLOG: emitted before DOM ready');
+  console.error('EARLYERR: synthetic error emitted pre-DOM');
+  fetch('data.json').then(function (r) { return r.text(); })
+    .then(function () { console.log('EARLYFETCH: body read'); })
+    .catch(function () { console.log('EARLYFETCH: failed'); });
+  setTimeout(function () { throw new Error('EARLYTHROW: pre-DOM uncaught'); }, 5);
+</script>
+<style>
+  body { font: 14px/1.5 monospace; margin: 16px; }
+  .r { padding: 3px 0; border-bottom: 1px solid #ddd; }
+  .r b { display: inline-block; width: 64px; }
+  .PASS { color: #0a7d24; font-weight: bold; }
+  .FAIL { color: #c62828; font-weight: bold; }
+  h1 { font-size: 16px; }
+</style>
+</head>
+<body>
+<h1>Pocket DevTools e2e3 — userscript persistence</h1>
+<div id="phase">starting…</div>
+<div id="out"></div>
+<script>
+(function () {
+  var P = (location.search.match(/[?&]p=([ABC])/) || [])[1] || 'A';
+  document.getElementById('phase').textContent = 'Phase ' + P;
+
+  function results() {
+    try { return JSON.parse(sessionStorage.getItem('e2e3:results')) || []; }
+    catch (e) { return []; }
+  }
+  function save(list) { sessionStorage.setItem('e2e3:results', JSON.stringify(list)); }
+  function rec(list, name, ok, info) {
+    list.push({ name: name, ok: !!ok, info: info || '' });
+    save(list);
+  }
+  function pdt() { return window.__POCKET_DEVTOOLS__; }
+  function sheetOpen() {
+    try { return pdt()._app().classList.contains('sheet-open'); }
+    catch (e) { return false; }
+  }
+  function entries() { try { return pdt().entries(); } catch (e) { return []; } }
+  function someEntry(re) {
+    var es = entries();
+    for (var i = 0; i < es.length; i++) if (re.test(es[i].text)) return true;
+    return false;
+  }
+  function next(p) { location.replace('?p=' + p); }
+
+  window.addEventListener('load', function () {
+    setTimeout(function () {
+      var list = results();
+      if (P === 'A') { list = []; save(list); } /* fresh run: reset */
+
+      if (P === 'A') {
+        var E = window.__EARLY__ || {};
+        rec(list, 'A1 head: core ran while loading', E.readyState === 'loading', 'readyState=' + E.readyState);
+        rec(list, 'A2 head: no document.body yet', E.hadBody === false, 'body=' + E.hadBody);
+        rec(list, 'A3 head: UI deferred (no early boot)', E.booted === false, 'booted=' + E.booted);
+        rec(list, 'A4 booted after DOM ready', !!pdt(), 'api=' + !!pdt());
+        rec(list, 'A5 version is 5.1.0', pdt() && pdt().version === '5.1.0', 'v=' + (pdt() && pdt().version));
+        rec(list, 'A6 edition is userscript', pdt() && pdt().edition === 'userscript', 'ed=' + (pdt() && pdt().edition));
+        rec(list, 'A7 background mode: sheet NOT auto-opened', pdt() && !sheetOpen(), 'open=' + sheetOpen());
+        var fab = null;
+        try { fab = pdt()._app().querySelector('.pdt-fab'); } catch (e) { /* noop */ }
+        rec(list, 'A8 FAB offered while backgrounded', !!fab && fab.style.display !== 'none', 'display=' + (fab && fab.style.display));
+        rec(list, 'A9 early console.log captured', someEntry(/EARLYLOG/));
+        rec(list, 'A10 early console.error captured', someEntry(/EARLYERR/));
+        rec(list, 'A11 pre-DOM uncaught error captured', someEntry(/EARLYTHROW/));
+        var reqs = pdt() ? pdt().requests() : [];
+        var sawFetch = reqs.some(function (r) { return /data\.json/.test(r.url); });
+        rec(list, 'A12 pre-DOM fetch captured', sawFetch, reqs.length + ' reqs');
+        rec(list, 'A13 banner mentions userscript edition', someEntry(/userscript edition/));
+        try { pdt().open(); } catch (e) { /* noop */ }
+        rec(list, 'A14 open() opens the sheet', sheetOpen());
+        rec(list, 'A15 session flag set on open', sessionStorage.getItem('pdt:open') === '1');
+        try { pdt().close(); } catch (e) { /* noop */ }
+        rec(list, 'A16 session flag cleared on close', sessionStorage.getItem('pdt:open') === null);
+        /* leave the sheet OPEN, on the network tab, then reload — phase B
+         * must come back exactly like this */
+        try { pdt().tab('network'); pdt().open(); } catch (e) { /* noop */ }
+        next('B');
+      }
+
+      if (P === 'B') {
+        rec(list, 'B1 still booted after refresh', !!pdt(), 'api=' + !!pdt());
+        rec(list, 'B2 sheet re-opened by itself', pdt() && sheetOpen(), 'open=' + sheetOpen());
+        var tab = null;
+        try { tab = JSON.parse(pdt()._dump()).activeTab; } catch (e) { /* noop */ }
+        rec(list, 'B3 last tab (network) restored', tab === 'network', 'tab=' + tab);
+        rec(list, 'B4 fresh early capture on this load', someEntry(/EARLYLOG/));
+        next('C');
+      }
+
+      if (P === 'C') {
+        rec(list, 'C1 excluded host: zero boot', !window.__POCKET_DEVTOOLS__, 'api=' + !!window.__POCKET_DEVTOOLS__);
+        var nativeFetch = /native code/.test(String(window.fetch));
+        rec(list, 'C2 fetch left untouched (no hooks)', nativeFetch, 'fetch=' + String(window.fetch).slice(0, 40));
+        /* cleanup so the suite can be re-run from scratch */
+        try { localStorage.removeItem('pdt:settings'); } catch (e) { /* noop */ }
+        try { sessionStorage.removeItem('pdt:open'); } catch (e) { /* noop */ }
+
+        var pass = 0, fail = 0, out = document.getElementById('out');
+        list.forEach(function (r) {
+          var d = document.createElement('div');
+          d.className = 'r';
+          d.innerHTML = '<b class="' + (r.ok ? 'PASS' : 'FAIL') + '">' + (r.ok ? 'PASS' : 'FAIL') +
+            '</b> ' + r.name + (r.info ? ' <i>[' + r.info + ']</i>' : '');
+          out.appendChild(d);
+          r.ok ? pass++ : fail++;
+        });
+        var total = pass + fail;
+        document.title = 'E2E3 ' + (fail ? 'FAIL' : 'PASS') + ' ' + pass + '/' + total;
+        document.getElementById('phase').textContent =
+          'Phase C (final) — ' + (fail ? 'FAILED' : 'ALL PASS') + ': ' + pass + '/' + total;
+        window.__E2E3_DONE__ = { pass: pass, fail: fail, total: total, results: list };
+      }
+    }, P === 'B' ? 600 : 400);
+  });
+})();
+</script>
+</body>
+</html>

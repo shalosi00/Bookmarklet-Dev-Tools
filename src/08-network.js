@@ -40,6 +40,57 @@ function netTouch() {
   }
 }
 
+/* ---------------- request blocker ----------------
+ * Persistent list of URL substring patterns. Matching XHR / fetch / sendBeacon
+ * requests never leave the browser; they appear in the list with status BLK. */
+function isBlocked(url) {
+  if (!ctx.blockList || !ctx.blockList.length) return false;
+  var u = String(url || '');
+  for (var i = 0; i < ctx.blockList.length; i++) {
+    var b = ctx.blockList[i];
+    if (b.on && b.pattern && u.indexOf(b.pattern) >= 0) return true;
+  }
+  return false;
+}
+function saveBlockList() { pdtSet('blocklist', ctx.blockList); }
+
+function manageBlocker() {
+  modal('Request blocker', function (body, close) {
+    function draw() {
+      body.textContent = '';
+      var addIn = h('input.pdt-input.pdt-grow', { placeholder: 'URL contains… e.g. doubleclick.net', autocapitalize: 'off', spellcheck: 'false' });
+      var addBtn = h('button.pdt-btn.acc', { type: 'button' }, [iconEl('plus', 14), 'Block']);
+      addBtn.addEventListener('click', function () {
+        var p = addIn.value.trim();
+        if (!p) { toast('Enter a URL fragment'); return; }
+        ctx.blockList.push({ pattern: p, on: true });
+        saveBlockList(); draw();
+      });
+      body.appendChild(h('.pdt-row', [addIn, addBtn]));
+      if (!ctx.blockList.length) {
+        body.appendChild(h('.pdt-empty', 'No blocking rules yet.\nAdd a URL fragment to block matching requests (ads, trackers, analytics…).'));
+        return;
+      }
+      ctx.blockList.forEach(function (b, i) {
+        var row = h('.pdt-row', { style: { margin: '6px 0' } }, [
+          h('button.pdt-chip' + (b.on ? '.on' : ''), { type: 'button', style: { fontFamily: 'var(--mono)' } }, truncate(b.pattern, 32)),
+          h('button.pdt-ib', { type: 'button', title: 'Delete rule', onclick: function () {
+            ctx.blockList.splice(i, 1); saveBlockList(); draw();
+          } }, iconEl('trash', 14))
+        ]);
+        row.firstChild.addEventListener('click', function () {
+          b.on = !b.on; saveBlockList(); draw();
+        });
+        body.appendChild(row);
+      });
+      body.appendChild(h('.pdt-mtext', { style: { fontSize: '.82em', color: 'var(--muted)' } },
+        'Rules apply to XHR, fetch and sendBeacon requests made after the rule was added. ' +
+        'Blocked requests show as BLK in the list. Rules persist across page loads.'));
+    }
+    draw();
+  });
+}
+
 /* ---------------- hooks (installed at load) ---------------- */
 function reqBodyText(body) {
   if (body == null) return null;
@@ -70,6 +121,16 @@ function reqBodyText(body) {
       var xhr = this, meta = xhr.__pdt || (xhr.__pdt = { method: 'GET', url: '', reqHeaders: {} });
       meta.start = netNow();
       meta.reqBody = reqBodyText(body);
+      if (isBlocked(meta.url)) {
+        meta.pending = false;
+        meta.blocked = true;
+        meta.status = null;
+        meta.duration = 0;
+        meta.error = 'Blocked by Pocket DevTools request blocker';
+        netAdd('XHR', meta);
+        try { this.abort(); } catch (e) { /* noop */ }
+        return;
+      }
       var entry = netAdd('XHR', meta);
       xhr.addEventListener('loadend', function () {
         meta.pending = false;
@@ -99,6 +160,14 @@ function reqBodyText(body) {
           url: (typeof input === 'string') ? input : (input && input.url) || String(input),
           reqHeaders: {}, start: netNow()
         };
+        if (isBlocked(meta.url)) {
+          netAdd('Fetch', {
+            method: meta.method, url: meta.url, reqHeaders: {}, start: netNow(),
+            pending: false, blocked: true, status: null, duration: 0,
+            error: 'Blocked by Pocket DevTools request blocker'
+          });
+          return Promise.reject(new TypeError('Blocked by Pocket DevTools request blocker'));
+        }
         if (init && init.headers) {
           try {
             if (typeof Headers !== 'undefined' && init.headers instanceof Headers) {
@@ -139,6 +208,22 @@ function reqBodyText(body) {
       };
     }
   } catch (e) { conEmit('warn', ['DevTools: could not hook fetch']); }
+
+  /* ---- sendBeacon ---- */
+  try {
+    var OB = navigator.sendBeacon && navigator.sendBeacon.bind(navigator);
+    if (OB) {
+      navigator.sendBeacon = function (url, data) {
+        netAdd('Beacon', {
+          method: 'POST', url: String(url), reqBody: reqBodyText(data),
+          pending: false, status: isBlocked(url) ? null : 204, blocked: isBlocked(url),
+          duration: 0, error: isBlocked(url) ? 'Blocked by request blocker' : null
+        });
+        if (isBlocked(url)) return true;
+        return OB(url, data);
+      };
+    }
+  } catch (e) { /* noop */ }
 
   /* ---- WebSocket ---- */
   try {
@@ -194,9 +279,9 @@ function renderNetList() {
 }
 
 function netRow(e) {
-  var statusCls = e.pending ? 'sp' : (e.status >= 500 || e.status === 0) ? 's5' :
+  var statusCls = e.blocked ? 's4' : e.pending ? 'sp' : (e.status >= 500 || e.status === 0) ? 's5' :
     e.status >= 400 ? 's4' : e.status >= 300 ? 's3' : 's2';
-  var statusTxt = e.pending ? '…' : (e.status || 'ERR');
+  var statusTxt = e.blocked ? 'BLK' : e.pending ? '…' : (e.status || 'ERR');
   var method = e.method || 'GET';
   var mcls = 'b-' + ({ GET: 'get', POST: 'post', PUT: 'put', PATCH: 'patch', DELETE: 'delete' }[method] || 'other');
 
@@ -226,7 +311,14 @@ function renderNetDetail() {
   panel.appendChild(h('.pdt-toolbar', [back,
     h('button.pdt-ib', { type: 'button', title: 'Copy URL', onclick: function () { copyText(e.finalUrl || e.url); } }, iconEl('copy')),
     h('button.pdt-ib', { type: 'button', title: 'Copy as cURL', onclick: function () { copyText(netCurl(e)); } }, iconEl('external')),
-    h('button.pdt-ib', { type: 'button', title: 'Copy response', onclick: function () { copyText(e.resBody || ''); } }, iconEl('download'))
+    h('button.pdt-ib', { type: 'button', title: 'Copy as fetch()', onclick: function () { copyText(netFetchSnippet(e)); } }, iconEl('code')),
+    h('button.pdt-ib', { type: 'button', title: 'Copy response', onclick: function () { copyText(e.resBody || ''); } }, iconEl('download')),
+    h('button.pdt-ib', { type: 'button', title: 'Block this URL', onclick: function () {
+      var u = e.finalUrl || e.url;
+      try { u = new URL(u, location.href).host; } catch (e2) { /* keep raw */ }
+      ctx.blockList.push({ pattern: u, on: true });
+      saveBlockList(); toast('Blocked: ' + u);
+    } }, iconEl('shield'))
   ]));
 
   var sc = h('.pdt-scroll');
@@ -289,6 +381,78 @@ function netCurl(e) {
   return parts.join(' \\\n');
 }
 
+function netFetchSnippet(e) {
+  var opts = { method: e.method || 'GET' };
+  var hdrs = {};
+  for (var k in e.reqHeaders) hdrs[k] = e.reqHeaders[k];
+  if (Object.keys(hdrs).length) opts.headers = hdrs;
+  if (e.reqBody && e.method !== 'GET' && e.method !== 'HEAD') opts.body = e.reqBody;
+  return 'fetch(' + JSON.stringify(e.finalUrl || e.url) + ', ' + JSON.stringify(opts, null, 2) + ')';
+}
+
+/* ---------------- HAR export ---------------- */
+function buildHar() {
+  var entries = [];
+  ctx.netEntries.forEach(function (e) {
+    if (e.blocked || e.pending || !e.url) return;
+    function hdrs(obj) {
+      var out = [];
+      if (typeof obj === 'string') {
+        obj.split('\r\n').forEach(function (line) {
+          var i = line.indexOf(':');
+          if (i > 0) out.push({ name: line.slice(0, i).trim(), value: line.slice(i + 1).trim() });
+        });
+      } else if (obj) {
+        for (var k in obj) out.push({ name: k, value: String(obj[k]) });
+      }
+      return out;
+    }
+    var body = (typeof e.resBody === 'string') ? e.resBody : '';
+    entries.push({
+      startedDateTime: new Date(e.t).toISOString(),
+      time: Math.round(e.duration || 0),
+      request: {
+        method: e.method || 'GET',
+        url: e.finalUrl || e.url,
+        httpVersion: '',
+        cookies: [],
+        headers: hdrs(e.reqHeaders),
+        queryString: [],
+        headersSize: -1,
+        bodySize: e.reqBody ? e.reqBody.length : 0,
+        postData: e.reqBody ? { mimeType: (e.reqHeaders['Content-Type'] || e.reqHeaders['content-type'] || 'text/plain'), text: String(e.reqBody).slice(0, 16384) } : undefined
+      },
+      response: {
+        status: e.status || 0,
+        statusText: '',
+        httpVersion: '',
+        cookies: [],
+        headers: hdrs(e.resHeaders),
+        content: { size: e.size || (body ? body.length : 0), mimeType: '', text: body.slice(0, 524288) },
+        redirectURL: '',
+        headersSize: -1,
+        bodySize: e.size || 0
+      },
+      cache: {},
+      timings: { blocked: 0, dns: -1, connect: -1, send: 0, wait: Math.round(e.duration || 0), receive: 0, ssl: -1 }
+    });
+  });
+  return {
+    log: {
+      version: '1.2',
+      creator: { name: 'Pocket DevTools', version: VERSION, comment: 'https://github.com/shalosi00/Bookmarklet-Dev-Tools' },
+      entries: entries
+    }
+  };
+}
+function exportHar() {
+  var har = buildHar();
+  if (!har.log.entries.length) { toast('No completed requests to export'); return; }
+  var name = 'pdt-' + (location.host || 'page').replace(/[^a-z0-9.-]/gi, '_') + '-' +
+    new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '.har';
+  downloadFile(name, JSON.stringify(har, null, 1), 'application/json');
+}
+
 function renderNetPanel() {
   if (!panelEls.network) return;
   var panel = panelEls.network;
@@ -315,8 +479,15 @@ function renderNetPanel() {
     renderNetPanel();
   });
 
+  var blockedCount = ctx.blockList.filter(function (b) { return b.on; }).length;
+  var blockBtn = h('button.pdt-ib', { type: 'button', title: 'Request blocker' + (blockedCount ? ' (' + blockedCount + ' active)' : '') },
+    iconEl(blockedCount ? 'shield' : 'shieldoff'));
+  if (blockedCount) blockBtn.style.color = 'var(--warn)';
+  blockBtn.addEventListener('click', manageBlocker);
+
   panel.appendChild(h('.pdt-toolbar', [
-    chips.all, chips.xhr, chips.fetch, chips.ws, search, count, pauseBtn,
+    chips.all, chips.xhr, chips.fetch, chips.ws, search, count, pauseBtn, blockBtn,
+    h('button.pdt-ib', { type: 'button', title: 'Export HAR', onclick: exportHar }, iconEl('save')),
     h('button.pdt-ib', { type: 'button', title: 'Clear', onclick: function () { ctx.netEntries = []; renderNetPanel(); } }, iconEl('trash'))
   ]));
   netListEl = h('.pdt-scroll', { style: { padding: '0' } });

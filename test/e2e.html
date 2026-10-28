@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pocket DevTools v5 E2E Suite</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 16px; background: #f5f5f0; color: #222; }
+  .box { background: #4a90d9; color: #fff; padding: 24px; margin: 16px 0; border-radius: 8px; }
+  .box.warn { background: #d97706; }
+  .card { border: 1px solid #ccc; padding: 12px; border-radius: 6px; background: #fff; }
+  #target { border: 3px solid #333; padding: 20px; margin: 10px 0; color: #333; background: #eef; }
+  img { max-width: 100px; display: block; margin: 8px 0; }
+</style>
+</head>
+<body>
+<h1>E2E Test Page</h1>
+<div class="box" id="main-box">Main box <span id="inner">inner span</span></div>
+<div class="box warn">Warning box with <a href="#link">a link</a></div>
+<div id="target" class="card" data-role="target" data-state="off" role="region" aria-label="target">
+  <p style="color: #336699">Tap target element</p>
+  <ul><li>one</li><li>two</li><li>three</li></ul>
+</div>
+<h2>Second heading</h2>
+<img src="broken-image.png" alt="">
+<button id="net-btn">Fire requests</button>
+<button id="err-btn">Throw error</button>
+<script src="jsQR.min.js"></script>
+<script>
+  /* seed data */
+  try {
+    localStorage.setItem('test-ls', JSON.stringify({ hello: 'world', n: 42 }));
+    sessionStorage.setItem('test-ss', 'session-value');
+    document.cookie = 'testcookie=e2e; path=/';
+  } catch (e) {}
+
+  /* test harness */
+  window.__RESULTS = [];
+  window.__DONE = false;
+  function T(name, fn) {
+    var rec = { name: name, pass: null, info: '' };
+    window.__RESULTS.push(rec);
+    try {
+      var r = fn();
+      rec.pass = r === true || r === undefined;
+      if (r !== true && r !== undefined) rec.info = String(r);
+    } catch (e) { rec.pass = false; rec.info = 'EXCEPTION: ' + (e && e.message || e); }
+  }
+  function AT(name, fn) {
+    var rec = { name: name, pass: null, info: '' };
+    window.__RESULTS.push(rec);
+    /* serialize async tests so they never race each other */
+    window.__CHAIN = (window.__CHAIN || Promise.resolve()).then(function () {
+      return Promise.resolve().then(fn);
+    }).then(function (v) {
+      rec.pass = v === true;
+      if (v !== true) rec.info = String(v);
+    }, function (e) { rec.pass = false; rec.info = 'REJECT: ' + (e && e.message || e); });
+  }
+  window.__summary = function () {
+    var pass = 0, fail = 0, failed = [];
+    window.__RESULTS.forEach(function (r) {
+      if (r.pass === true) pass++;
+      else { fail++; failed.push(r.name + ' :: ' + r.info); }
+      if (r.pass === null) { fail++; failed.push(r.name + ' :: (never resolved)'); }
+    });
+    return { total: window.__RESULTS.length, pass: pass, fail: fail, failed: failed };
+  };
+</script>
+
+<!-- the bookmarklet build under test -->
+<script src="../src.js"></script>
+<script>
+  /* ================================================================
+   * E2E SUITE
+   * ================================================================ */
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  var P = null;
+  function R(code) { /* run() returns {ok, value} */
+    var r = P.run(code);
+    return r && r.ok ? r.value : ('ERR:' + (r && r.value));
+  }
+  function panel() { return P._app().querySelector('.pdt-panel.on'); }
+  function sub(label) { /* click sub-tab whose text matches */
+    var btns = panel().querySelectorAll('.pdt-subb');
+    for (var i = 0; i < btns.length; i++) {
+      if (btns[i].textContent.toLowerCase().indexOf(label.toLowerCase()) >= 0) { btns[i].click(); return true; }
+    }
+    return false;
+  }
+
+  function runSuite() {
+    P = window.__POCKET_DEVTOOLS__;
+    if (!P) { window.__DONE = true; return; }
+    window.__CHAIN = Promise.resolve();
+
+    /* ---------- A. boot & UI ---------- */
+    T('A1 api exposed', function () { return P.version === '5.1.0' || 'version=' + P.version; });
+    T('A3 open sheet', function () {
+      P.open();
+      return P._app().classList.contains('sheet-open') || 'no sheet-open class';
+    });
+    T('A4 all 13 panels have tabs', function () {
+      var tabs = P._app().querySelectorAll('.pdt-tab');
+      return tabs.length === 13 || 'tabs=' + tabs.length;
+    });
+    T('A5 each panel renders content', function () {
+      var bad = [];
+      var ids = ['console','elements','styles','network','api','page','sources','storage','perf','toolkit','utils','plugins','settings'];
+      ids.forEach(function (id) {
+        try {
+          P.tab(id);
+          if (!panel()) { bad.push(id + ':no-active'); return; }
+          var n = panel().querySelectorAll('*').length;
+          if (n < 3) bad.push(id + ':empty(' + n + ')');
+        } catch (e) { bad.push(id + ':' + (e.message || e)); }
+      });
+      return bad.length ? bad.join('|') : true;
+    });
+    T('A6 FAB returns after close', function () {
+      P.close();
+      var fab = P._app().querySelector('.pdt-fab');
+      var visible = !!fab.offsetParent || getComputedStyle(fab).display !== 'none';
+      P.open();
+      return visible || 'fab not visible after close';
+    });
+    AT('A7 theme cards switch', function () {
+      P.tab('settings');
+      var cards = panel().querySelectorAll('.pdt-themecard');
+      if (cards.length < 3) return 'cards=' + cards.length;
+      cards[1].click();
+      return sleep(450).then(function () {
+        var t1 = JSON.parse(localStorage.getItem('pdt:settings') || '{}').theme;
+        cards[2].click();
+        return sleep(450).then(function () {
+          var t2 = JSON.parse(localStorage.getItem('pdt:settings') || '{}').theme;
+          cards[0].click();
+          return sleep(450).then(function () {
+            return (t1 === 'light' && t2 === 'amoled') || 't1=' + t1 + ' t2=' + t2;
+          });
+        });
+      });
+    });
+    AT('A8 lastTab persistence', function () {
+      P.tab('network');
+      return sleep(450).then(function () {
+        var saved = JSON.parse(localStorage.getItem('pdt:settings') || '{}');
+        return saved.lastTab === 'network' || 'saved=' + saved.lastTab;
+      });
+    });
+
+    /* ---------- B. console ---------- */
+    T('B1 basic capture', function () {
+      console.log('e2e-log'); console.info('e2e-info'); console.warn('e2e-warn'); console.error('e2e-error'); console.debug('e2e-debug');
+      var es = P.entries();
+      var texts = es.map(function (e) { return e.text; }).join('|');
+      return (texts.indexOf('e2e-log') >= 0 && texts.indexOf('e2e-warn') >= 0 && texts.indexOf('e2e-error') >= 0) || texts.slice(-200);
+    });
+    T('B2 console.table', function () {
+      console.table([{ a: 1, b: 2 }, { a: 3, b: 4 }]);
+      P.tab('console');
+      var t = panel().querySelector('table');
+      if (!t) return 'no table rendered';
+      var rowCount = t.querySelectorAll('tr').length;
+      var headCells = t.querySelectorAll('th').length;
+      return (rowCount === 3 && headCells === 3) || 'rows=' + rowCount + ' th=' + headCells;
+    });
+    AT('B3 time/timeEnd', function () {
+      console.time('e2e-timer');
+      return sleep(80).then(function () {
+        console.timeEnd('e2e-timer');
+        var es = P.entries();
+        var m = null;
+        es.slice(-4).forEach(function (e) {
+          if (e.text && e.text.indexOf('e2e-timer:') === 0) m = e.text;
+        });
+        return (m && /\d/.test(m)) || 'entries tail: ' + es.slice(-4).map(function (e) { return JSON.stringify(e.text); }).join(',');
+      });
+    });
+    T('B4 count', function () {
+      console.count('e2e-count'); console.count('e2e-count'); console.count('e2e-count');
+      var es = P.entries();
+      var ok = es.some(function (e) { return e.text === 'e2e-count: 3'; });
+      return ok || 'tail: ' + es.slice(-3).map(function (e) { return JSON.stringify(e.text); }).join(',');
+    });
+    T('B5 group depth', function () {
+      console.group('g1'); console.log('inside-g'); console.groupEnd();
+      var es = P.entries();
+      var inside = null;
+      es.forEach(function (e) { if (e.text === 'inside-g') inside = e; });
+      return (inside && inside.depth === 1) || 'depth=' + (inside && inside.depth);
+    });
+    T('B6 trace', function () {
+      console.trace('e2e-trace');
+      var es = P.entries();
+      var tr = null;
+      es.forEach(function (e) { if (e.stack) tr = e; });
+      return (tr && /e2e-trace/.test(tr.text)) || 'no trace entry';
+    });
+    T('B7 assert', function () {
+      console.assert(false, 'assert-msg-e2e');
+      var es = P.entries();
+      return es.some(function (e) { return e.level === 'error' && /assert-msg-e2e/.test(e.text); }) || 'no assert error';
+    });
+    T('B8 object inspector data', function () {
+      console.log('obj-test', { alpha: 1, beta: [1, 2, 3] });
+      var es = P.entries();
+      var e = null;
+      es.forEach(function (x) { if (/obj-test/.test(x.text)) e = x; });
+      return (e && e.val && e.val.alpha === 1) || 'no val retained';
+    });
+    AT('B10 uncaught captured', function () {
+      window.setTimeout(function () { throw new Error('e2e-uncaught'); }, 0);
+      return sleep(300).then(function () {
+        var es = P.entries();
+        return es.some(function (e) { return /e2e-uncaught/.test(e.text) && e.level === 'error'; }) || 'not captured: ' + es.slice(-3).map(function (e) { return e.level + ':' + e.text; }).join(' | ');
+      });
+    });
+    AT('B11 unhandled rejection', function () {
+      Promise.reject(new Error('e2e-rejected'));
+      return sleep(300).then(function () {
+        var es = P.entries();
+        return es.some(function (e) { return /e2e-rejected/.test(e.text); }) || 'not captured';
+      });
+    });
+    T('B12 run + $_', function () {
+      var r1 = R('6 * 7');
+      var v = R('$_ + 1');
+      return (r1 === 42 && v === 43) || 'r1=' + r1 + ' v=' + v;
+    });
+    T('B13 helpers $ $$ $x', function () {
+      var a = R('$("#target")');
+      var b = R('$$("li").length');
+      var c = R('$x("//li").length');
+      return (a && a.id === 'target' && b === 3 && c === 3) || 'a=' + (a && a.id) + ' b=' + b + ' c=' + c;
+    });
+    T('B14 $0 after select', function () {
+      P.select(document.getElementById('inner'));
+      return R('$0.id') === 'inner' || 'wrong $0: ' + R('$0 && $0.id');
+    });
+    T('B15 selHistory $0-$2', function () {
+      P.select(document.getElementById('inner'));
+      P.select(document.getElementById('main-box'));
+      P.select(document.getElementById('target'));
+      var r0 = R('$0.id'), r1 = R('$1.id'), r2 = R('$2.id');
+      return (r0 === 'target' && r1 === 'main-box' && r2 === 'inner') || r0 + '/' + r1 + '/' + r2;
+    });
+    T('B16 keys/values', function () {
+      var k = R('keys({x:1,y:2}).join(",")');
+      var v = R('values({x:1,y:2}).join(",")');
+      return (k === 'x,y' && v === '1,2') || 'k=' + k + ' v=' + v;
+    });
+    T('B17 error result', function () {
+      var r = P.run('syntax~~~error');
+      return (r && r.ok === false) || 'should be ok:false';
+    });
+
+    /* ---------- C. network ---------- */
+    AT('C1 XHR captured with status', function () {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', 'data.json');
+      xhr.send();
+      return sleep(600).then(function () {
+        var rs = P.requests();
+        var hit = rs.filter(function (r) { return /data\.json/.test(r.url) && r.status === 200; });
+        return hit.length === 1 || 'rs=' + JSON.stringify(rs.map(function (r) { return { u: r.url.slice(-24), s: r.status, p: r.pending }; }));
+      });
+    });
+    AT('C2 fetch captured with body', function () {
+      return fetch('data.json?ft=1').then(function (res) { return res.text(); }).then(function (txt) {
+        return sleep(400).then(function () {
+          var rs = P.requests();
+          var hit = rs.filter(function (r) { return /ft=1/.test(r.url) && r.status === 200; });
+          if (!hit.length) return 'not captured: ' + JSON.stringify(rs.slice(-3).map(function (r) { return r.url.slice(-20); }));
+          if (!(typeof hit[0].resBody === 'string' && hit[0].resBody.length > 0)) return 'no resBody captured';
+          return true;
+        });
+      });
+    });
+    AT('C3 blocklist blocks', function () {
+      P.block('blocked-e2e');
+      return fetch('data.json?blocked-e2e=1').then(function () {
+        P.unblockAll();
+        return 'fetch was NOT blocked';
+      }, function (err) {
+        var n = P.blocklist().length;
+        P.unblockAll();
+        return (n === 1) ? true : 'blocklist had ' + n;
+      });
+    });
+    AT('C4 HAR export', function () {
+      return sleep(400).then(function () {
+        var har = P.har();
+        var ok = har && har.log && har.log.entries && har.log.entries.length >= 1;
+        var e0 = ok && har.log.entries[0];
+        var sane = e0 && e0.request && e0.request.url && e0.request.method;
+        return (ok && sane) ? true : 'har entries=' + (har && har.log && har.log.entries && har.log.entries.length);
+      });
+    });
+    AT('C5 net detail opens', function () {
+      return sleep(300).then(function () {
+        P.tab('network');
+        var rows = panel().querySelectorAll('.pdt-nrow2');
+        if (!rows.length) return 'no net rows (nrow2): entries=' + P.requests().length;
+        rows[0].click();
+        var html = panel().innerHTML;
+        return /(curl|cURL|Headers|headers|URL)/.test(html) || 'no detail';
+      });
+    });
+
+    /* ---------- D. elements ---------- */
+    T('D1 select + breadcrumb', function () {
+      P.select(document.getElementById('main-box'));
+      P.tab('elements');
+      var html = panel().innerHTML;
+      return /main-box/.test(html) || 'no breadcrumb';
+    });
+    T('D2 box model px', function () {
+      P.select(document.getElementById('target'));
+      var html = panel().innerHTML;
+      return /\d+px/.test(html) || 'no px values';
+    });
+    T('D3 DOM tree has nodes', function () {
+      sub('tree');
+      var rows = panel().querySelectorAll('.pdt-node');
+      return rows.length >= 3 || 'rows=' + rows.length;
+    });
+    T('D4 listeners captured', function () {
+      var el = document.getElementById('net-btn');
+      el.addEventListener('click', function () { /* e2e listener */ });
+      var ls = P.listeners(el);
+      return ls.length >= 1 || 'listeners=' + ls.length;
+    });
+    T('D6 inspect toggles', function () {
+      P.inspect(); P.inspect();
+      return true;
+    });
+
+    /* ---------- E. styles ---------- */
+    T('E1 computed styles', function () {
+      P.tab('styles');
+      var html = panel().innerHTML;
+      return /(color|background|font|margin|padding)/i.test(html) || 'no style props';
+    });
+
+    /* ---------- F. page audits ---------- */
+    T('F1 page overview', function () {
+      P.tab('page');
+      var html = panel().innerHTML;
+      return /E2E Suite/.test(html) || 'no title';
+    });
+    T('F2 headings audit', function () {
+      P.tab('page');
+      if (!sub('headings')) return 'no headings sub';
+      var html = panel().innerHTML;
+      return /Second heading/.test(html) || 'headings not listed';
+    });
+    T('F3 images audit', function () {
+      P.tab('page');
+      if (!sub('images')) return 'no images sub';
+      var html = panel().innerHTML;
+      return /alt/i.test(html) || 'no alt info';
+    });
+    T('F4 links audit', function () {
+      P.tab('page');
+      if (!sub('links')) return 'no links sub';
+      return /#link/.test(panel().innerHTML) || 'link not listed';
+    });
+
+    /* ---------- G. storage ---------- */
+    T('G1 LS editor lists test-ls', function () {
+      P.tab('storage');
+      sub('local');
+      return /test-ls/.test(panel().innerHTML) || 'test-ls not shown';
+    });
+    T('G2 cookie editor shows testcookie', function () {
+      P.tab('storage');
+      sub('cookies');
+      return /testcookie/.test(panel().innerHTML) || 'cookie not shown';
+    });
+
+    /* ---------- H. performance ---------- */
+    T('H1 perf metrics', function () {
+      P.tab('perf');
+      var html = panel().innerHTML;
+      return /(ms|Load|DCL|navigation)/i.test(html) || 'no timing';
+    });
+
+    /* ---------- I. toolkit ---------- */
+    AT('I1 QR renders + decodes round-trip', function () {
+      P.tab('toolkit');
+      if (!sub('qr')) return 'no qr sub';
+      var inp = panel().querySelector('input, textarea');
+      if (!inp) return 'no QR input';
+      inp.value = 'https://e2e.example/pdt-qr-test';
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      return sleep(700).then(function () {
+        var cv = panel().querySelector('canvas');
+        if (!cv) return 'no canvas';
+        if (typeof jsQR !== 'function') return 'jsQR missing';
+        var d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height);
+        var dec = jsQR(d.data, d.width, d.height);
+        return (dec && dec.data === 'https://e2e.example/pdt-qr-test') || 'decoded=' + (dec && dec.data);
+      });
+    });
+    T('I2 color conversions', function () {
+      P.tab('toolkit');
+      if (!sub('color')) return 'no color sub';
+      var inp = panel().querySelector('input');
+      if (!inp) return 'no color input';
+      inp.value = '#ff0000';
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      var html = panel().innerHTML;
+      return /rgb\(255, ?0, ?0\)/i.test(html) || 'no rgb shown';
+    });
+
+    /* ---------- J. API tester ---------- */
+    AT('J1 API GET works', function () {
+      P.tab('api');
+      var urlIn = null;
+      panel().querySelectorAll('input').forEach(function (i) {
+        if (/https?:/.test(i.placeholder || '')) urlIn = i;
+      });
+      if (!urlIn) return 'no url input';
+      urlIn.value = 'data.json';
+      urlIn.dispatchEvent(new Event('input', { bubbles: true }));
+      var send = null;
+      panel().querySelectorAll('button').forEach(function (b) { if (/^send$/i.test(b.textContent.trim())) send = b; });
+      if (!send) return 'no send button';
+      send.click();
+      return sleep(900).then(function () {
+        var html = panel().innerHTML;
+        return /\b200\b/.test(html) || 'no 200 in response';
+      });
+    });
+
+    /* ---------- K. settings/snippets ---------- */
+    T('K1 settings renders', function () {
+      P.tab('settings');
+      return /(theme|Theme)/.test(panel().innerHTML) || 'no theme settings';
+    });
+    T('K2 console filter chips', function () {
+      P.tab('console');
+      var chips = panel().querySelectorAll('.pdt-chip');
+      return chips.length >= 5 || 'chips=' + chips.length;
+    });
+
+    P.tab('console');
+    window.__CHAIN.then(function () { window.__DONE = true; });
+  }
+
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    setTimeout(runSuite, 300);
+  } else {
+    document.addEventListener('DOMContentLoaded', function () { setTimeout(runSuite, 300); });
+  }
+</script>
+</body>
+</html>

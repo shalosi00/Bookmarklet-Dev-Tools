@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDT v5 E2E Phase 2</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 16px; background: #f5f5f0; color: #222; }
+  .box { background: #4a90d9; color: #fff; padding: 24px; margin: 16px 0; border-radius: 8px; }
+  #target { border: 3px solid #333; padding: 20px; color: #333; background: #eef; }
+</style>
+</head>
+<body>
+<h1>Phase 2 Test Page</h1>
+<div class="box" id="main-box">Main box <span id="inner">inner span</span></div>
+<div id="target"><p>Tap target</p><ul><li>one</li><li>two</li></ul></div>
+<input id="typed" type="text" placeholder="type here">
+<script>
+  window.__RESULTS = [];
+  window.__DONE = false;
+  function T(name, fn) {
+    var rec = { name: name, pass: null, info: '' };
+    window.__RESULTS.push(rec);
+    try {
+      var r = fn();
+      rec.pass = r === true || r === undefined;
+      if (r !== true && r !== undefined) rec.info = String(r);
+    } catch (e) { rec.pass = false; rec.info = 'EXCEPTION: ' + (e && e.message || e); }
+  }
+  function AT(name, fn) {
+    var rec = { name: name, pass: null, info: '' };
+    window.__RESULTS.push(rec);
+    window.__CHAIN = (window.__CHAIN || Promise.resolve()).then(function () {
+      return Promise.resolve().then(fn);
+    }).then(function (v) {
+      rec.pass = v === true;
+      if (v !== true) rec.info = String(v);
+    }, function (e) { rec.pass = false; rec.info = 'REJECT: ' + (e && e.message || e); });
+  }
+  window.__summary = function () {
+    var pass = 0, fail = 0, failed = [];
+    window.__RESULTS.forEach(function (r) {
+      if (r.pass === true) pass++;
+      else { fail++; failed.push(r.name + ' :: ' + r.info); }
+      if (r.pass === null) { fail++; failed.push(r.name + ' :: (never resolved)'); }
+    });
+    return { total: window.__RESULTS.length, pass: pass, fail: fail, failed: failed };
+  };
+  try {
+    localStorage.setItem('p2-ls', 'phase2-value');
+    document.cookie = 'p2cookie=abc; path=/';
+  } catch (e) {}
+</script>
+<script src="../src.js"></script>
+<script>
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  var P = null;
+  function R(code) { var r = P.run(code); return r && r.ok ? r.value : ('ERR:' + (r && r.value)); }
+  function panel() { return P._app().querySelector('.pdt-panel.on'); }
+  function sub(label) {
+    var btns = panel().querySelectorAll('.pdt-subb');
+    for (var i = 0; i < btns.length; i++) {
+      if (btns[i].textContent.toLowerCase().indexOf(label.toLowerCase()) >= 0) { btns[i].click(); return true; }
+    }
+    return false;
+  }
+  function clickBtnByText(scope, re) {
+    var btns = scope.querySelectorAll('button');
+    for (var i = 0; i < btns.length; i++) {
+      if (re.test((btns[i].textContent || '') + ' ' + (btns[i].title || ''))) { btns[i].click(); return btns[i]; }
+    }
+    return null;
+  }
+
+  function runSuite() {
+    P = window.__POCKET_DEVTOOLS__;
+    if (!P) { window.__DONE = true; return; }
+    window.__CHAIN = Promise.resolve();
+
+    /* ---------- console input UI (real typing) ---------- */
+    AT('P1 console input via UI', function () {
+      P.tab('console');
+      var input = panel().querySelector('input[type="text"]');
+      if (!input) return 'no console input';
+      input.value = '2 + 3';
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      return sleep(150).then(function () {
+        var es = P.entries();
+        var hasIn = es.some(function (e) { return e.kind === 'input' && /2 \+ 3/.test(e.text); });
+        var hasOut = es.some(function (e) { return /^\u2190 5$/.test(e.text) || /\u2190 5/.test(e.text); });
+        return (hasIn && hasOut) || 'in=' + hasIn + ' out=' + hasOut + ' tail=' + es.slice(-3).map(function (e) { return e.text; }).join('~');
+      });
+    });
+    AT('P2 history navigation', function () {
+      P.tab('console');
+      var input = panel().querySelector('input[type="text"]');
+      input.value = '"second-cmd"';
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      return sleep(120).then(function () {
+        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+        return sleep(80).then(function () {
+          var v1 = input.value;
+          input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+          return sleep(80).then(function () {
+            var v2 = input.value;
+            return (v1 === '"second-cmd"' && v2 === '2 + 3') || 'v1=' + v1 + ' v2=' + v2;
+          });
+        });
+      });
+    });
+
+    /* ---------- storage editing flows ---------- */
+    AT('P3 LS add via UI', function () {
+      P.tab('storage');
+      sub('local');
+      var addBtn = clickBtnByText(panel(), /add|\+/i);
+      if (!addBtn) return 'no add button';
+      return sleep(200).then(function () {
+        /* modal should be open inside app */
+        var app = P._app();
+        var inputs = app.querySelectorAll('.pdt-modal input, .pdt-sheet input');
+        var modal = app.querySelector('.pdt-modal, [class*="modal"]');
+        if (!modal) { modal = document.querySelector('.pdt-modal'); }
+        if (!modal) return 'no modal appeared';
+        var min = modal.querySelectorAll('input, textarea');
+        if (!min.length) return 'no modal inputs';
+        min[0].value = 'p2-added-key';
+        if (min[1]) min[1].value = 'p2-added-value';
+        var ok = clickBtnByText(modal, /ok|apply|save|add/i);
+        if (!ok) return 'no modal ok button';
+        return sleep(250).then(function () {
+          sub('local');
+          return /p2-added-key/.test(panel().innerHTML) || 'key not listed after add';
+        });
+      });
+    });
+    AT('P4 LS edit via UI', function () {
+      P.tab('storage');
+      sub('local');
+      var rows = panel().querySelectorAll('tr');
+      var row = null;
+      for (var i = 0; i < rows.length; i++) if (/p2-added-key/.test(rows[i].textContent)) row = rows[i];
+      if (!row) return 'row not found';
+      var editBtn = row.querySelector('button[title*="dit"], button');
+      editBtn.click();
+      return sleep(200).then(function () {
+        var modal = P._app().querySelector('.pdt-modal, [class*="modal"]') || document.querySelector('.pdt-modal');
+        if (!modal) return 'no edit modal';
+        var min = modal.querySelectorAll('input, textarea');
+        if (min.length < 2) return 'modal inputs=' + min.length;
+        min[1].value = 'p2-edited-value';
+        var ok = clickBtnByText(modal, /ok|apply|save/i);
+        if (!ok) return 'no ok btn';
+        return sleep(250).then(function () {
+          sub('local');
+          return /p2-edited-value/.test(panel().innerHTML) || 'edited value not shown';
+        });
+      });
+    });
+    AT('P5 LS delete via UI', function () {
+      P.tab('storage');
+      sub('local');
+      var rows = panel().querySelectorAll('tr');
+      var row = null;
+      for (var i = 0; i < rows.length; i++) if (/p2-added-key/.test(rows[i].textContent)) row = rows[i];
+      if (!row) return 'row not found';
+      var delBtn = row.querySelectorAll('button');
+      delBtn[delBtn.length - 1].click(); /* trash is last */
+      return sleep(200).then(function () {
+        /* confirm modal? */
+        var modal = P._app().querySelector('.pdt-modal, [class*="modal"]') || document.querySelector('.pdt-modal');
+        if (modal) {
+          var yes = clickBtnByText(modal, /delete|ok|yes|confirm/i);
+          if (!yes) return 'no confirm button';
+        }
+        return sleep(250).then(function () {
+          sub('local');
+          return !/p2-added-key/.test(panel().innerHTML) || 'key still listed';
+        });
+      });
+    });
+    AT('P6 cookie add via UI', function () {
+      P.tab('storage');
+      sub('cookies');
+      var addBtn = clickBtnByText(panel(), /add|\+/i);
+      if (!addBtn) return 'no cookie add button';
+      return sleep(200).then(function () {
+        var modal = P._app().querySelector('.pdt-modal, [class*="modal"]') || document.querySelector('.pdt-modal');
+        if (!modal) return 'no modal';
+        var min = modal.querySelectorAll('input, textarea');
+        if (!min.length) return 'no inputs';
+        min[0].value = 'p2newcookie';
+        if (min[1]) min[1].value = 'cookieval';
+        var ok = clickBtnByText(modal, /ok|apply|save|add/i);
+        return sleep(300).then(function () {
+          sub('cookies');
+          return /p2newcookie/.test(panel().innerHTML) || 'new cookie not listed; doc.cookie=' + document.cookie;
+        });
+      });
+    });
+
+    /* ---------- WebSocket capture ---------- */
+    AT('P7 WebSocket frames captured', function () {
+      var msgs = 0;
+      try {
+        var ws = new WebSocket('ws://127.0.0.1:8899');
+        ws.onopen = function () { ws.send('p2-ws-hello'); };
+        ws.onmessage = function () { msgs++; };
+        ws.onerror = function () {};
+      } catch (e) { return 'ws construct failed: ' + e.message; }
+      return sleep(1200).then(function () {
+        try { /* ws.close() may throw on invalid state */ } catch (e) {}
+        var rs = P.requests().filter(function (r) { return r.type === 'WS' || /ws/i.test(r.type || ''); });
+        return rs.length >= 1 || 'no WS entry; types=' + P.requests().map(function (r) { return r.type; }).join(',');
+      });
+    });
+
+    /* ---------- toolkit: JWT / base64 / regex ---------- */
+    AT('P8 JWT decode', function () {
+      P.tab('toolkit');
+      if (!sub('convert')) return 'no convert sub';
+      var inp = panel().querySelector('textarea');
+      if (!inp) return 'no textarea';
+      /* header.payload.signature with base64url of {"alg":"HS256","typ":"JWT"} and {"sub":"p2","n":7} */
+      var tok = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJwMiIsIm4iOjd9.c2lnbmF0dXJl';
+      inp.value = tok;
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      return sleep(120).then(function () {
+        var jwtBtn = clickBtnByText(panel(), /jwt/i);
+        if (!jwtBtn) return 'no JWT button';
+        return sleep(150).then(function () {
+          var html = panel().innerHTML;
+          return (/HS256/.test(html) && /"sub"/.test(html)) || 'jwt fields not shown';
+        });
+      });
+    });
+    AT('P9 base64 round-trip', function () {
+      P.tab('toolkit');
+      sub('convert');
+      var inp = panel().querySelector('textarea');
+      inp.value = 'Phase2 \u00e9\u00e8\u4f60';
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      return sleep(120).then(function () {
+        var enc = clickBtnByText(panel(), /base64/i);
+        if (!enc) return 'no encode btn: ' + panel().querySelectorAll('button').length;
+        return sleep(150).then(function () {
+          var html = panel().innerHTML;
+          return /UGhhc2Uy/.test(html) || 'encoded value not shown';
+        });
+      });
+    });
+    AT('P10 regex tester matches', function () {
+      P.tab('toolkit');
+      if (!sub('regex')) return 'no regex sub';
+      var fields = panel().querySelectorAll('input, textarea');
+      if (fields.length < 2) return 'fields=' + fields.length;
+      fields[0].value = '\\d+';
+      fields[0].dispatchEvent(new Event('input', { bubbles: true }));
+      var ta = panel().querySelector('textarea');
+      ta.value = 'abc 123 def 456';
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      return sleep(300).then(function () {
+        var html = panel().innerHTML;
+        return (/123/.test(html) && /456/.test(html) && /match/i.test(html)) || 'matches not shown';
+      });
+    });
+
+    /* ---------- snippets ---------- */
+    AT('P11 snippet save + run', function () {
+      P.tab('utils');
+      if (!sub('snippet')) return 'no snippets sub';
+      /* click "New snippet" -> modal with name + code */
+      var newBtn = clickBtnByText(panel(), /new snippet/i);
+      if (!newBtn) return 'no New snippet button';
+      return sleep(250).then(function () {
+        var app = P._app();
+        var modal = app.querySelector('.pdt-modal, [class*="modal"]') || document.querySelector('.pdt-modal');
+        if (!modal) return 'no editor modal';
+        var nameIn = modal.querySelector('input');
+        var codeTa = modal.querySelector('textarea');
+        if (!nameIn || !codeTa) return 'modal fields missing: in=' + !!nameIn + ' ta=' + !!codeTa;
+        nameIn.value = 'p2-snippet';
+        codeTa.value = 'window.__p2snippet = 42';
+        var okBtn = clickBtnByText(modal, /save|ok|apply/i);
+        if (!okBtn) return 'no modal save btn';
+        return sleep(350).then(function () {
+          sub('snippet');
+          var html = panel().innerHTML;
+          if (!/p2-snippet/.test(html)) return 'snippet not listed after save';
+          /* find its Run button: last card matching name */
+          var cards = panel().querySelectorAll('.pdt-card');
+          var runBtn = null;
+          for (var i = 0; i < cards.length; i++) {
+            if (/p2-snippet/.test(cards[i].textContent)) {
+              var btns = cards[i].querySelectorAll('button');
+              for (var j = 0; j < btns.length; j++) {
+                if (/run/i.test(btns[j].title || '')) runBtn = btns[j];
+              }
+            }
+          }
+          if (!runBtn) return 'no run button on snippet card';
+          runBtn.click();
+          return sleep(400).then(function () {
+            return window.__p2snippet === 42 || 'snippet did not execute';
+          });
+        });
+      });
+    });
+
+    /* ---------- sources panel ---------- */
+    T('P12 sources lists scripts', function () {
+      P.tab('sources');
+      var html = panel().innerHTML;
+      return /(HTML|CSS|JS)/.test(html) || 'sources empty';
+    });
+
+    /* ---------- plugins panel ---------- */
+    T('P13 plugins panel renders', function () {
+      P.tab('plugins');
+      var html = panel().innerHTML;
+      return /(plugin|install|add)/i.test(html) || 'plugins empty';
+    });
+
+    /* ---------- FPS meter ---------- */
+    AT('P14 FPS meter samples', function () {
+      P.tab('perf');
+      var fpsBtn = clickBtnByText(panel(), /fps|measure/i);
+      if (!fpsBtn) return 'no fps button';
+      return sleep(1200).then(function () {
+        var html = panel().innerHTML;
+        return /\d+\s*fps/i.test(html) || 'no fps reading';
+      });
+    });
+
+    /* ---------- monitorEvents helper ---------- */
+    AT('P15 monitorEvents logs', function () {
+      R('monitorEvents(document.getElementById("typed"), ["input"])');
+      var inp = document.getElementById('typed');
+      inp.value = 'x';
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      return sleep(300).then(function () {
+        var es = P.entries();
+        return es.some(function (e) { return /\[event\]/.test(e.text) && /input/i.test(e.text); }) || 'no event log';
+      });
+    });
+
+    /* ---------- copy as cURL from detail ---------- */
+    AT('P16 net detail + cURL', function () {
+      P.tab('network');
+      return sleep(200).then(function () {
+        var rows = panel().querySelectorAll('.pdt-nrow2');
+        if (!rows.length) return 'no rows';
+        rows[0].click();
+        return sleep(250).then(function () {
+          var html = panel().innerHTML;
+          return /curl/i.test(html) || 'no curl in detail';
+        });
+      });
+    });
+
+    /* ---------- amoled theme var ---------- */
+    T('P17 amoled theme applies', function () {
+      P.tab('settings');
+      var cards = panel().querySelectorAll('.pdt-themecard');
+      if (cards.length < 3) return 'cards=' + cards.length;
+      cards[2].click(); /* amoled */
+      var app = P._app();
+      var theme = app.dataset.theme || app.getAttribute('data-theme');
+      cards[0].click(); /* restore dark */
+      return theme === 'amoled' || 'theme=' + theme;
+    });
+
+    /* ---------- XPath shown for selection ---------- */
+    T('P18 elements detail shows xpath', function () {
+      P.select(document.getElementById('inner'));
+      P.tab('elements');
+      var html = panel().innerHTML;
+      return /xpath/i.test(html) || 'no xpath shown';
+    });
+
+    window.__CHAIN.then(function () { window.__DONE = true; });
+  }
+  if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(runSuite, 300);
+  else document.addEventListener('DOMContentLoaded', function () { setTimeout(runSuite, 300); });
+</script>
+</body>
+</html>

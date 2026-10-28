@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDT user.js artifact check</title>
+<!-- Loads the REAL shipped artifact (repo root pocket-devtools.user.js)
+     in <head> — the userscript header is pure JS comments, so the file must
+     parse and boot exactly like a userscript manager would run it. -->
+<script src="../pocket-devtools.user.js"></script>
+<style>body { font: 14px/1.5 monospace; margin: 16px; }</style>
+</head>
+<body>
+<div id="out">running…</div>
+<script>
+window.addEventListener('load', function () {
+  setTimeout(function () {
+    var R = [], P = window.__POCKET_DEVTOOLS__;
+    function t(name, ok, info) { R.push({ name: name, ok: !!ok, info: info || '' }); }
+    t('artifact parses and boots', !!P, 'api=' + !!P);
+    t('edition = userscript (header flag works)', P && P.edition === 'userscript', 'ed=' + (P && P.edition));
+    t('version 5.1.0', P && P.version === '5.1.0', 'v=' + (P && P.version));
+    var open = false;
+    try { open = P._app().classList.contains('sheet-open'); } catch (e) { /* noop */ }
+    t('background mode (no auto-open)', P && !open, 'open=' + open);
+    var fab = null;
+    try { fab = P._app().querySelector('.pdt-fab'); } catch (e) { /* noop */ }
+    t('FAB available', !!fab && fab.style.display !== 'none', 'd=' + (fab && fab.style.display));
+    t('capture active', P && P.entries().length > 0, 'n=' + (P ? P.entries().length : 0));
+    var pass = 0, fail = 0;
+    R.forEach(function (r) { r.ok ? pass++ : fail++; });
+    document.getElementById('out').innerHTML = R.map(function (r) {
+      return '<div class="' + (r.ok ? 'p' : 'f') + '">' + (r.ok ? 'PASS' : 'FAIL') + ' — ' +
+        r.name + (r.info ? ' [' + r.info + ']' : '') + '</div>';
+    }).join('');
+    window.__US_DONE__ = { pass: pass, fail: fail, results: R };
+    document.title = fail ? 'US-ARTIFACT FAIL' : 'US-ARTIFACT PASS ' + pass + '/' + (pass + fail);
+  }, 500);
+});
+console.log('US-ARTIFACT: console capture probe');
+</script>
+</body>
+</html>

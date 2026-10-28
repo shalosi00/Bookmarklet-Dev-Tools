@@ -59,7 +59,13 @@ function buildShell() {
 
   root.appendChild(app);
   (document.body || document.documentElement).appendChild(hostEl);
-  requestAnimationFrame(function () { openSheet(); });
+  /* Auto-open rules:
+   *   bookmarklet — the user just asked for it, always open;
+   *   userscript  — open only if "always open" is enabled, or the sheet was
+   *                 open before the refresh (session flag) — otherwise stay in
+   *                 the background and offer the FAB. */
+  var wantOpen = !IS_USERSCRIPT || settings.usAutoOpenSheet || ssGet('open') === '1';
+  if (wantOpen) requestAnimationFrame(function () { openSheet(); });
 
   buildTabs();
   switchTab(ctx.activeTab);
@@ -77,6 +83,7 @@ function buildTabs() {
 }
 function switchTab(id) {
   ctx.activeTab = id;
+  if (!tabsEl) return; /* UI not built yet (document-start) — remember only */
   var btns = root.querySelectorAll('.pdt-tab');
   for (var i = 0; i < btns.length; i++) {
     btns[i].classList.toggle('on', btns[i].dataset.tab === id);
@@ -98,20 +105,29 @@ function switchTab(id) {
   var cur = root.querySelector('.pdt-tab[data-tab="' + id + '"]');
   if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' });
   if (def.onShow) { try { def.onShow(); } catch (e) { /* noop */ } }
+  /* persist the active tab so the next session re-opens here */
+  if (settings.lastTab !== id) { settings.lastTab = id; saveSettings(); }
 }
 
 /* ---------------- open/close ---------------- */
 function openSheet() {
+  if (!sheetEl) { ssSet('open', '1'); return; } /* pre-DOM: remember intent */
   sheetEl.classList.add('open');
   app.classList.add('sheet-open');
+  ssSet('open', '1'); /* userscript: reopen after refresh while still open */
   if (ctx.activeTab) switchTab(ctx.activeTab);
 }
 function closeSheet() {
+  if (!sheetEl) { ssSet('open', null); return; }
   sheetEl.classList.remove('open');
   app.classList.remove('sheet-open');
+  ssSet('open', null);
   if (inspectOn) stopInspect(true);
 }
-function toggleSheet() { sheetEl.classList.contains('open') ? closeSheet() : openSheet(); }
+function toggleSheet() {
+  if (!sheetEl) { ssSet('open', null); return; }
+  sheetEl.classList.contains('open') ? closeSheet() : openSheet();
+}
 
 /* ---------------- resize drag (handle) ---------------- */
 function setupResizeDrag() {

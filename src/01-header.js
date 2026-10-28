@@ -1,5 +1,5 @@
 /*
- * Pocket DevTools v4.0 — mobile-first developer tools as a bookmarklet.
+ * Pocket DevTools v5.0 — mobile-first developer tools as a bookmarklet.
  * A clean, readable rewrite of the improved fork of
  * DeveloperExotic/Bookmarklet-Dev-Tools (MIT license).
  *
@@ -15,7 +15,12 @@
     return;
   }
 
-  var VERSION = '4.0.0';
+  var VERSION = '5.1.0';
+
+  /* Build flavour. The userscript edition (pocket-devtools.user.js) sets this
+   * flag right before the core runs: capture starts at document-start and the
+   * sheet reopens automatically after a page refresh. */
+  var IS_USERSCRIPT = window.__PDT_USERSCRIPT__ === true;
 
   /* ------------------------------------------------------------------ *
    * Settings (persisted in localStorage, namespaced with "pdt:")
@@ -27,7 +32,11 @@
     maxConsole: 500,      /* max console entries kept */
     netBodyLimit: 65536,  /* response bytes captured per request */
     showFAB: true,
-    fabX: null, fabY: null
+    fabX: null, fabY: null,
+    lastTab: 'console',    /* panel re-opened on next load */
+    usEnabled: true,       /* userscript: auto-inject on every page */
+    usAutoOpenSheet: false,/* userscript: open the sheet on every page load */
+    usExcluded: ''         /* userscript: comma/newline-separated host substrings to skip */
   };
 
   function loadSettings() {
@@ -39,8 +48,19 @@
     for (var k in DEFAULTS) if (!(k in s)) s[k] = DEFAULTS[k];
     return s;
   }
-
   var settings = loadSettings();
+
+  /* Userscript site exclusion — decided before any hook or UI is installed,
+   * so excluded sites stay 100% untouched. */
+  if (IS_USERSCRIPT) {
+    if (!settings.usEnabled) return;
+    var exHost = (location.host || '').toLowerCase();
+    var exPats = String(settings.usExcluded || '').split(/[\n,]+/);
+    for (var xi = 0; xi < exPats.length; xi++) {
+      var xp = exPats[xi].trim().toLowerCase();
+      if (xp && exHost && exHost.indexOf(xp) >= 0) return;
+    }
+  }
   var saveTimer = null;
   function saveSettings() {
     clearTimeout(saveTimer);
@@ -48,6 +68,12 @@
       try { localStorage.setItem('pdt:settings', JSON.stringify(settings)); } catch (e) { /* noop */ }
     }, 250);
   }
+  /* The debounced write must survive a refresh/navigation — flush it on
+   * pagehide so settings (last tab, toggles…) are never lost mid-debounce. */
+  window.addEventListener('pagehide', function () {
+    clearTimeout(saveTimer);
+    try { localStorage.setItem('pdt:settings', JSON.stringify(settings)); } catch (e) { /* noop */ }
+  });
 
   /* ------------------------------------------------------------------ *
    * App storage helpers (snippets, plugins, console history)
@@ -65,16 +91,34 @@
     catch (e) { return false; }
   }
 
+  /* Session-scoped storage: survives a page refresh, cleared when the tab
+   * closes — used to remember whether the sheet was open (userscript mode). */
+  function ssGet(key) {
+    try { return sessionStorage.getItem('pdt:' + key); } catch (e) { return null; }
+  }
+  function ssSet(key, value) {
+    try {
+      if (value == null) sessionStorage.removeItem('pdt:' + key);
+      else sessionStorage.setItem('pdt:' + key, value);
+    } catch (e) { /* noop */ }
+  }
+
   /* ------------------------------------------------------------------ *
    * Shared context
    * ------------------------------------------------------------------ */
   var ctx = {
     selected: null,                 /* currently selected element */
-    activeTab: 'console',
+    selHistory: [],                 /* $0 .. $4 — last 5 selected elements */
+    lastResult: undefined,          /* $_ — result of last console command */
+    activeTab: (settings.lastTab && /^[a-z]+$/.test(settings.lastTab)) ? settings.lastTab : 'console',
     netEntries: [], netSeq: 0, netPaused: false,
     conEntries: [], conRendered: 0,
-    conFilters: { log: true, info: true, warn: true, error: true },
+    conFilters: { log: true, info: true, warn: true, error: true, debug: true },
     conSearch: '',
+    conTimers: {},                  /* console.time() labels */
+    conCounters: {},                /* console.count() labels */
+    groupDepth: 0,                  /* console.group() indent */
+    blockList: pdtGet('blocklist', []),   /* network request blocker patterns */
     history: pdtGet('history', []),
     cssDisabled: false,
     outlineOn: false,

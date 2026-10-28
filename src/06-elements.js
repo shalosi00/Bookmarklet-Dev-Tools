@@ -1,9 +1,88 @@
 /*
- * 06-elements.js — inspect mode (touch-friendly), DOM tree, selected-element editor
+ * 06-elements.js — inspect mode (touch-friendly), DOM tree, selected-element editor,
+ *                event listener capture, Edit HTML, XPath
  */
 
 var inspectOn = false, ovlBox = null, ovlLabel = null;
-var elTreeEl = null, elDetailEl = null, elSub = 'tree';
+var elTreeEl = null, elDetailEl = null, elEvEl = null, elSub = 'tree';
+
+/* ---------------- event listener capture (installed at load) ----------------
+ * Records every addEventListener()/removeEventListener() call made AFTER DevTools
+ * loaded (up to 5000), so the Events tab can list them per element. */
+var evtListeners = [];
+var EVT_CAP = 5000;
+(function installListenerCapture() {
+  try {
+    var AEL = EventTarget.prototype.addEventListener;
+    var REL = EventTarget.prototype.removeEventListener;
+    EventTarget.prototype.addEventListener = function (type, fn, opts) {
+      try {
+        if (typeof fn === 'function' && evtListeners.length < EVT_CAP) {
+          evtListeners.push({
+            el: this, type: type, fn: fn,
+            capture: !!(opts && (opts.capture === true || (typeof opts === 'object' && opts.capture))),
+            once: !!(opts && typeof opts === 'object' && opts.once),
+            passive: !!(opts && typeof opts === 'object' && opts.passive)
+          });
+        }
+      } catch (e) { /* noop */ }
+      return AEL.apply(this, arguments);
+    };
+    EventTarget.prototype.removeEventListener = function (type, fn, opts) {
+      try {
+        var cap = !!(opts && (opts.capture === true || (typeof opts === 'object' && opts.capture)));
+        for (var i = 0; i < evtListeners.length; i++) {
+          var L = evtListeners[i];
+          if (L.el === this && L.type === type && L.fn === fn && L.capture === cap) { evtListeners.splice(i, 1); break; }
+        }
+      } catch (e) { /* noop */ }
+      return REL.apply(this, arguments);
+    };
+  } catch (e) { /* prototype locked */ }
+})();
+
+function listenersFor(el) {
+  var out = [];
+  try {
+    evtListeners.forEach(function (L) {
+      if (L.el === el) {
+        out.push({
+          type: L.type, capture: L.capture, once: L.once, passive: L.passive,
+          name: L.fn.name || 'anonymous',
+          code: truncate(String(L.fn).replace(/\s+/g, ' '), 200)
+        });
+      }
+    });
+  } catch (e) { /* noop */ }
+  /* inline on* handlers are always visible */
+  if (el && el.nodeType === 1 && el.attributes) {
+    for (var i = 0; i < el.attributes.length; i++) {
+      var a = el.attributes[i];
+      if (/^on[a-z]+$/i.test(a.name)) {
+        out.push({ type: a.name.slice(2), capture: false, once: false, passive: false, name: '(inline ' + a.name + ')', code: truncate(a.value, 200) });
+      }
+    }
+  }
+  return out;
+}
+
+function xpathFor(el) {
+  if (!el || el.nodeType !== 1) return '';
+  if (el.id) return '//*[@id="' + el.id + '"]';
+  var parts = [];
+  var node = el;
+  while (node && node.nodeType === 1 && node !== document.documentElement) {
+    var s = node.tagName.toLowerCase();
+    var p = node.parentElement;
+    if (p) {
+      var sibs = Array.prototype.filter.call(p.children, function (c) { return c.tagName === node.tagName; });
+      if (sibs.length > 1) s += '[' + (sibs.indexOf(node) + 1) + ']';
+    }
+    parts.unshift(s);
+    node = node.parentElement;
+  }
+  return '/' + (node && node === document.documentElement ? 'html/' : '') + parts.join('/');
+}
 
 /* ---------------- inspect mode ---------------- */
 function toggleInspect() { inspectOn ? stopInspect(true) : startInspect(); }
@@ -108,6 +187,11 @@ function inspClick(e) {
 /* ---------------- selection ---------------- */
 function selectElement(el) {
   ctx.selected = el;
+  /* $0 .. $4 history (like DevTools) — dedupe consecutive, cap 5 */
+  if (ctx.selHistory[0] !== el) {
+    ctx.selHistory.unshift(el);
+    if (ctx.selHistory.length > 5) ctx.selHistory.length = 5;
+  }
   elSub = 'detail';
   if (panelEls.elements) {
     renderElementsPanel();
@@ -247,6 +331,8 @@ function renderDetail() {
     h('button.pdt-btn', { type: 'button', onclick: function () { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); toast('Scrolled to element'); } }, [iconEl('eye', 14), 'Scroll to']),
     h('button.pdt-btn', { type: 'button', onclick: function () { copyText(el.outerHTML); } }, [iconEl('copy', 14), 'Copy HTML']),
     h('button.pdt-btn', { type: 'button', onclick: function () { copyText(cssSelectorFor(el)); } }, [iconEl('copy', 14), 'Copy selector']),
+    h('button.pdt-btn', { type: 'button', onclick: function () { copyText(xpathFor(el)); } }, [iconEl('copy', 14), 'Copy XPath']),
+    h('button.pdt-btn', { type: 'button', onclick: function () { editOuterHtml(el); } }, [iconEl('edit', 14), 'Edit HTML']),
     h('button.pdt-btn.danger', { type: 'button', onclick: function () {
       confirmModal('Delete this element from the page?', 'Delete', function () {
         var p = el.parentElement;
@@ -293,6 +379,84 @@ function renderDetail() {
 
 function kv(k, v) { return h('.pdt-kv', [h('b', k), h('span', String(v))]); }
 
+/* ---------------- edit outer HTML ---------------- */
+function editOuterHtml(el) {
+  var area = h('textarea.pdt-area', { rows: 10, spellcheck: 'false' });
+  area.value = el.outerHTML;
+  modal('Edit HTML — ' + el.tagName.toLowerCase(), function (body, close) {
+    body.appendChild(area);
+    body.appendChild(h('.pdt-mfoot', [
+      h('button.pdt-btn', { type: 'button', onclick: close }, 'Cancel'),
+      h('button.pdt-btn.acc', { type: 'button', onclick: function () {
+        try {
+          var p = el.parentElement, idx = -1;
+          if (p) idx = Array.prototype.indexOf.call(p.children, el);
+          var tpl = document.createElement('template');
+          tpl.innerHTML = area.value;
+          if (!tpl.content.firstChild) { toast('Nothing to insert — element removed'); close(); return; }
+          if (p) {
+            p.replaceChild(tpl.content.firstChild, el);
+            var next = p.children[idx] || p.firstElementChild;
+            if (next) { ctx.selected = next; }
+          } else {
+            el.outerHTML = area.value;
+          }
+          close(); renderDetail(); renderTree(); toast('HTML updated');
+        } catch (e) { toast('Edit failed: ' + (e.message || e)); }
+      } }, 'Apply')
+    ]));
+  }, true);
+}
+
+/* ---------------- events sub-tab ---------------- */
+function renderEvents() {
+  if (!elEvEl) return;
+  elEvEl.textContent = '';
+  var stats = h('.pdt-card');
+  stats.appendChild(kv('Listeners captured', String(evtListeners.length)));
+  stats.appendChild(h('.pdt-mtext', { style: { fontSize: '.82em', color: 'var(--muted)', marginTop: '6px' } },
+    'Listeners are recorded from the moment DevTools loads. Handlers attached earlier by the page, and those added via inline on* attributes, are detected per element below.'));
+  elEvEl.appendChild(stats);
+
+  var el = ctx.selected;
+  if (!el || !el.isConnected) {
+    elEvEl.appendChild(h('.pdt-empty', 'Select an element (crosshair button) to see its listeners.'));
+  } else {
+    var list = listenersFor(el);
+    var card = h('.pdt-card');
+    card.appendChild(h('.pdt-label', 'Listeners on ' + (el.tagName.toLowerCase() + (el.id ? '#' + el.id : '')) + ' (' + list.length + ')'));
+    if (!list.length) card.appendChild(h('.pdt-empty', 'No listeners on this element.'));
+    list.forEach(function (L) {
+      var flags = [L.capture ? 'capture' : 'bubble', L.once ? 'once' : '', L.passive ? 'passive' : '']
+        .filter(Boolean).join(', ');
+      card.appendChild(h('.pdt-evl', [
+        h('.pdt-row', [
+          h('span.pdt-badge.b-post', L.type),
+          h('span.pdt-grow.pdt-mono', { style: { fontSize: '.85em' } }, L.name),
+          h('span', { style: { fontSize: '.78em', color: 'var(--muted)' } }, flags)
+        ]),
+        h('pre.pdt-mono', { style: { fontSize: '.78em', color: 'var(--fg2)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: '4px 0 8px' } }, L.code)
+      ]));
+    });
+    elEvEl.appendChild(card);
+  }
+
+  /* busiest elements */
+  var perEl = new Map();
+  evtListeners.forEach(function (L) {
+    var k = (L.el && L.el.tagName) ? (L.el === window ? 'window' : L.el === document ? 'document' :
+      L.el.tagName.toLowerCase() + (L.el.id ? '#' + L.el.id : '')) : '(detached)';
+    perEl.set(k, (perEl.get(k) || 0) + 1);
+  });
+  if (perEl.size) {
+    var top = Array.from(perEl.entries()).sort(function (a, b) { return b[1] - a[1]; }).slice(0, 10);
+    var c2 = h('.pdt-card');
+    c2.appendChild(h('.pdt-label', 'Most listeners (all elements)'));
+    top.forEach(function (t) { c2.appendChild(kv(t[0], t[1])); });
+    elEvEl.appendChild(c2);
+  }
+}
+
 /* ---------------- panel ---------------- */
 function renderElementsPanel() {
   if (!panelEls.elements) return;
@@ -300,23 +464,30 @@ function renderElementsPanel() {
   panel.textContent = '';
   var subTree = h('button.pdt-subb' + (elSub === 'tree' ? '.on' : ''), 'Tree');
   var subDet = h('button.pdt-subb' + (elSub === 'detail' ? '.on' : ''), 'Selected');
+  var subEv = h('button.pdt-subb' + (elSub === 'events' ? '.on' : ''), 'Events');
   subTree.addEventListener('click', function () { elSub = 'tree'; renderElementsPanel(); });
   subDet.addEventListener('click', function () { elSub = 'detail'; renderElementsPanel(); });
+  subEv.addEventListener('click', function () { elSub = 'events'; renderElementsPanel(); });
 
   var top = h('.pdt-toolbar', [
     h('button.pdt-btn', { type: 'button', onclick: function () { startInspect(); } }, [iconEl('inspect', 14), 'Inspect']),
     h('span.pdt-grow')
   ]);
   panel.appendChild(top);
-  panel.appendChild(h('.pdt-sub', [subTree, subDet]));
+  panel.appendChild(h('.pdt-sub', [subTree, subDet, subEv]));
 
   elTreeEl = h('.pdt-scroll');
   elDetailEl = h('.pdt-scroll');
-  if (elSub === 'tree') { elDetailEl.style.display = 'none'; } else { elTreeEl.style.display = 'none'; }
+  elEvEl = h('.pdt-scroll');
+  if (elSub !== 'tree') elTreeEl.style.display = 'none';
+  if (elSub !== 'detail') elDetailEl.style.display = 'none';
+  if (elSub !== 'events') elEvEl.style.display = 'none';
   panel.appendChild(elTreeEl);
   panel.appendChild(elDetailEl);
+  panel.appendChild(elEvEl);
   renderTree();
   renderDetail();
+  renderEvents();
 }
 
 registerPanel({
