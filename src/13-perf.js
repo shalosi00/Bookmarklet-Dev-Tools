@@ -175,15 +175,17 @@ function startFps() {
   fpsRunning = true; fpsFrames = []; fpsLast = 0;
   function loop(t) {
     if (!fpsRunning) return;
-    if (fpsLast) {
-      fpsFrames.push(t - fpsLast);
-      if (fpsFrames.length > 90) fpsFrames.shift();
-      drawFps();
-    }
-    fpsLast = t;
-    fpsRafId = requestAnimationFrame(loop);
+    try {
+      if (fpsLast) {
+        fpsFrames.push(t - fpsLast);
+        if (fpsFrames.length > 90) fpsFrames.shift();
+        drawFps();
+      }
+      fpsLast = t;
+    } catch (e) { pdError(e, 'fps.loop'); }
+    fpsRafId = requestAnimationFrame(safe(loop, 'fps.loop'));
   }
-  fpsRafId = requestAnimationFrame(loop);
+  fpsRafId = requestAnimationFrame(safe(loop, 'fps.loop'));
 }
 function stopFps() {
   fpsRunning = false;
@@ -220,13 +222,13 @@ var longTasks = [], longTaskObs = null;
 function ensureLongTaskObserver() {
   if (longTaskObs) return true;
   try {
-    longTaskObs = new PerformanceObserver(function (list) {
+    longTaskObs = new PerformanceObserver(safe(function (list) {
       list.getEntries().forEach(function (e) {
         longTasks.push({ start: e.startTime, dur: e.duration, name: e.name || 'task' });
         if (longTasks.length > 200) longTasks.shift();
       });
       if (perfSub === 'tasks' && panelEls.perf) renderPerfPanel();
-    });
+    }, 'longtask'));
     longTaskObs.observe({ entryTypes: ['longtask'] });
     return true;
   } catch (e) {

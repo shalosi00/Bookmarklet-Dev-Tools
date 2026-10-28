@@ -4,6 +4,8 @@
 
 var netListEl = null, netDetailId = null, netFilterType = 'all', netSearchVal = '';
 var netRenderQueued = false;
+var netRowsById = {};   /* entry id -> row element (incremental rendering) */
+var netCountEl = null;  /* the "N req" counter, updated in place */
 
 function netNow() { return (performance && performance.now) ? performance.now() : Date.now(); }
 
@@ -27,6 +29,7 @@ function netAdd(type, meta) {
   e.duration = (e.duration != null) ? e.duration : null;
   e.error = e.error || null;
   e.msgs = e.msgs || 0;
+  e._dirty = true;   /* row not yet rendered / needs refresh */
   e.t = Date.now();
   ctx.netEntries.push(e);
   if (ctx.netEntries.length > 300) ctx.netEntries.splice(0, ctx.netEntries.length - 300);
@@ -34,9 +37,9 @@ function netAdd(type, meta) {
   return e;
 }
 function netTouch() {
-  if (!netRenderQueued && panelEls.network) {
+  if (!netRenderQueued && panelEls.network && netDetailId == null) {
     netRenderQueued = true;
-    requestAnimationFrame(function () { netRenderQueued = false; renderNetList(); });
+    requestAnimationFrame(safe(function () { netRenderQueued = false; netSyncList(); }, 'netSync'));
   }
 }
 
@@ -108,44 +111,67 @@ function reqBodyText(body) {
     var XO = XMLHttpRequest.prototype.open,
         XS = XMLHttpRequest.prototype.send,
         XH = XMLHttpRequest.prototype.setRequestHeader;
+    natives.xhrOpen = XO; natives.xhrSend = XS; natives.xhrSetHeader = XH;
+    stab().diag.xhr = true;
 
     XMLHttpRequest.prototype.open = function (m, u) {
-      this.__pdt = { method: String(m || 'GET').toUpperCase(), url: String(u || ''), reqHeaders: {} };
+      var self = this;
+      safe(function () {
+        self.__pdt = { method: String(m || 'GET').toUpperCase(), url: String(u || ''), reqHeaders: {} };
+      }, 'xhr.open')();
       return XO.apply(this, arguments);
     };
     XMLHttpRequest.prototype.setRequestHeader = function (k, v) {
-      if (this.__pdt) this.__pdt.reqHeaders[k] = v;
+      var self = this;
+      safe(function () {
+        if (self.__pdt) {
+          try { self.__pdt.reqHeaders[String(k)] = String(v); } catch (e) { /* hostile header */ }
+        }
+      }, 'xhr.setHeader')();
       return XH.apply(this, arguments);
     };
     XMLHttpRequest.prototype.send = function (body) {
-      var xhr = this, meta = xhr.__pdt || (xhr.__pdt = { method: 'GET', url: '', reqHeaders: {} });
-      meta.start = netNow();
-      meta.reqBody = reqBodyText(body);
-      if (isBlocked(meta.url)) {
-        meta.pending = false;
-        meta.blocked = true;
-        meta.status = null;
-        meta.duration = 0;
-        meta.error = 'Blocked by Pocket DevTools request blocker';
-        netAdd('XHR', meta);
-        try { this.abort(); } catch (e) { /* noop */ }
-        return;
+      var xhr = this;
+      var meta = xhr.__pdt;
+      if (!meta) {
+        try { meta = xhr.__pdt = { method: 'GET', url: '', reqHeaders: {} }; } catch (e) { meta = null; }
       }
-      var entry = netAdd('XHR', meta);
-      xhr.addEventListener('loadend', function () {
-        meta.pending = false;
-        meta.status = xhr.status;
-        meta.finalUrl = xhr.responseURL || meta.url;
-        meta.duration = netNow() - meta.start;
-        try { meta.resHeaders = xhr.getAllResponseHeaders() || null; } catch (e) { /* noop */ }
-        try {
-          var rt = xhr.responseText;
-          meta.size = rt ? rt.length : (xhr.response && xhr.response.size) || null;
-          if (rt && (!settings.netBodyLimit || rt.length <= settings.netBodyLimit)) meta.resBody = rt;
-          else if (rt) meta.resBody = truncate(rt, settings.netBodyLimit || 0) + '\n… (truncated)';
-        } catch (e) { meta.resBody = '[binary or blocked response: ' + (xhr.responseType || 'unknown') + ']'; }
-        if (entry) { netTouch(); }
-      });
+      if (meta) {
+        safe(function () {
+          meta.start = netNow();
+          meta.reqBody = reqBodyText(body);
+          if (isBlocked(meta.url)) {
+            meta.pending = false;
+            meta.blocked = true;
+            meta.status = null;
+            meta.duration = 0;
+            meta.error = 'Blocked by Pocket DevTools request blocker';
+            netAdd('XHR', meta);
+            meta.blockedAbort = true;
+          } else {
+            netAdd('XHR', meta);
+          }
+        }, 'xhr.send')();
+        if (meta.blockedAbort) {
+          try { xhr.abort(); } catch (e) { /* noop */ }
+          return;
+        }
+        xhr.addEventListener('loadend', safe(function () {
+          meta.pending = false;
+          try { meta.status = xhr.status; } catch (e) { meta.status = null; }
+          try { meta.finalUrl = xhr.responseURL || meta.url; } catch (e) { /* noop */ }
+          meta.duration = netNow() - meta.start;
+          try { meta.resHeaders = xhr.getAllResponseHeaders() || null; } catch (e) { /* noop */ }
+          try {
+            var rt = xhr.responseText;
+            meta.size = rt ? rt.length : (xhr.response && xhr.response.size) || null;
+            if (rt && (!settings.netBodyLimit || rt.length <= settings.netBodyLimit)) meta.resBody = rt;
+            else if (rt) meta.resBody = truncate(rt, settings.netBodyLimit || 0) + '\n… (truncated)';
+          } catch (e) { meta.resBody = '[binary or blocked response: ' + (xhr.responseType || 'unknown') + ']'; }
+          meta._dirty = true;
+          netTouch();
+        }, 'xhr.loadend'));
+      }
       return XS.apply(this, arguments);
     };
   } catch (e) { conEmit('warn', ['DevTools: could not hook XMLHttpRequest']); }
@@ -154,12 +180,17 @@ function reqBodyText(body) {
   try {
     var OF = window.fetch;
     if (OF) {
+      natives.fetch = OF;
+      stab().diag.fetch = true;
       window.fetch = function (input, init) {
         var meta = {
           method: ((init && init.method) || (input && input.method) || 'GET').toUpperCase(),
-          url: (typeof input === 'string') ? input : (input && input.url) || String(input),
+          url: '',
           reqHeaders: {}, start: netNow()
         };
+        safe(function () {
+          meta.url = (typeof input === 'string') ? input : (input && input.url) || String(input);
+        }, 'fetch.url')();
         if (isBlocked(meta.url)) {
           netAdd('Fetch', {
             method: meta.method, url: meta.url, reqHeaders: {}, start: netNow(),
@@ -178,32 +209,47 @@ function reqBodyText(body) {
           } catch (e) { /* noop */ }
         }
         if (init && init.body != null) meta.reqBody = reqBodyText(init.body);
-        var entry = netAdd('Fetch', meta);
-        var p = OF.apply(this, arguments);
-        p.then(function (res) {
+        netAdd('Fetch', meta);
+        var p;
+        try { p = OF.apply(this, arguments); }
+        catch (err) {
+          /* fetch() itself threw (invalid URL, …) — record it, then let the
+           * page see exactly what it would have seen without us */
           meta.pending = false;
-          meta.status = res.status;
-          meta.finalUrl = res.url || meta.url;
+          meta.status = 0;
+          meta.error = (err && err.message) || 'fetch() threw';
+          meta.duration = netNow() - meta.start;
+          meta._dirty = true;
+          netTouch();
+          throw err;
+        }
+        p.then(safe(function (res) {
+          meta.pending = false;
+          try { meta.status = res.status; } catch (e) { meta.status = null; }
+          try { meta.finalUrl = res.url || meta.url; } catch (e) { /* noop */ }
           meta.duration = netNow() - meta.start;
           var rh = {};
           try { res.headers.forEach(function (v, k) { rh[k] = v; }); meta.resHeaders = rh; } catch (e) { /* noop */ }
           try {
             if (settings.netBodyLimit > 0) {
-              res.clone().text().then(function (t) {
+              res.clone().text().then(safe(function (t) {
                 meta.size = t ? t.length : 0;
                 meta.resBody = (t.length > settings.netBodyLimit) ? truncate(t, settings.netBodyLimit) + '\n… (truncated)' : t;
+                meta._dirty = true;
                 netTouch();
-              }, function () { /* body unreadable */ });
+              }, 'fetch.body'), safe(function () { /* body unreadable */ }, 'fetch.body.err'));
             }
           } catch (e) { /* noop */ }
+          meta._dirty = true;
           netTouch();
-        }, function (err) {
+        }, 'fetch.ok'), safe(function (err) {
           meta.pending = false;
           meta.status = 0;
           meta.error = (err && err.message) || 'network error';
           meta.duration = netNow() - meta.start;
+          meta._dirty = true;
           netTouch();
-        });
+        }, 'fetch.err'));
         return p;
       };
     }
@@ -213,12 +259,16 @@ function reqBodyText(body) {
   try {
     var OB = navigator.sendBeacon && navigator.sendBeacon.bind(navigator);
     if (OB) {
+      natives.beacon = navigator.sendBeacon;
+      stab().diag.beacon = true;
       navigator.sendBeacon = function (url, data) {
-        netAdd('Beacon', {
-          method: 'POST', url: String(url), reqBody: reqBodyText(data),
-          pending: false, status: isBlocked(url) ? null : 204, blocked: isBlocked(url),
-          duration: 0, error: isBlocked(url) ? 'Blocked by request blocker' : null
-        });
+        safe(function () {
+          netAdd('Beacon', {
+            method: 'POST', url: String(url), reqBody: reqBodyText(data),
+            pending: false, status: isBlocked(url) ? null : 204, blocked: isBlocked(url),
+            duration: 0, error: isBlocked(url) ? 'Blocked by request blocker' : null
+          });
+        }, 'sendBeacon')();
         if (isBlocked(url)) return true;
         return OB(url, data);
       };
@@ -229,20 +279,28 @@ function reqBodyText(body) {
   try {
     var WS = window.WebSocket;
     if (WS) {
+      natives.ws = WS;
+      stab().diag.ws = true;
       var PWS = function (url, protocols) {
         var ws = (protocols !== undefined) ? new WS(url, protocols) : new WS(url);
-        var e = netAdd('WS', { method: 'WS', url: String(url), pending: false, status: 101, resBody: '' });
+        var e = null;
+        safe(function () {
+          e = netAdd('WS', { method: 'WS', url: String(url), pending: false, status: 101, resBody: '' });
+        }, 'ws.new')();
         if (e) {
-          ws.addEventListener('open', function () { e.resBody = '[connected]\n'; netTouch(); });
-          ws.addEventListener('close', function () { e.status = 1006; e.resBody += '[closed]\n'; e.duration = netNow() - e.start; netTouch(); });
-          ws.addEventListener('error', function () { e.error = 'WebSocket error'; netTouch(); });
-          ws.addEventListener('message', function (ev) {
+          ws.addEventListener('open', safe(function () { e.resBody = '[connected]\n'; e._dirty = true; netTouch(); }, 'ws.open'));
+          ws.addEventListener('close', safe(function () { e.status = 1006; e.resBody += '[closed]\n'; e.duration = netNow() - e.start; e._dirty = true; netTouch(); }, 'ws.close'));
+          ws.addEventListener('error', safe(function () { e.error = 'WebSocket error'; e._dirty = true; netTouch(); }, 'ws.error'));
+          ws.addEventListener('message', safe(function (ev) {
             e.msgs++;
             var d = (typeof ev.data === 'string') ? ev.data : '[binary frame]';
             e.resBody += '\u2193 ' + truncate(d, 300) + '\n';
+            /* chatty sockets must not grow the buffer without bound */
+            if (e.resBody.length > 12288) e.resBody = '\u2026\n' + e.resBody.slice(-10240);
             e.size = (e.size || 0) + d.length;
+            e._dirty = true;
             netTouch();
-          });
+          }, 'ws.msg'));
         }
         return ws;
       };
@@ -256,7 +314,12 @@ function reqBodyText(body) {
   } catch (e) { conEmit('warn', ['DevTools: could not hook WebSocket']); }
 })();
 
-/* ---------------- rendering ---------------- */
+/* ---------------- rendering ----------------
+ * Two paths:
+ *   renderNetList() — full rebuild (filter/search change, panel rebuild)
+ *   netSyncList()   — incremental: prepends new rows, patches changed rows
+ *                     in place, evicts dropped ones. Called at most once per
+ *                     animation frame, so busy pages never jank the panel. */
 function netPasses(e) {
   if (netFilterType !== 'all' && e.type.toLowerCase() !== netFilterType) return false;
   if (netSearchVal && e.url.toLowerCase().indexOf(netSearchVal.toLowerCase()) < 0) return false;
@@ -266,6 +329,7 @@ function netPasses(e) {
 function renderNetList() {
   if (!netListEl) return;
   netListEl.textContent = '';
+  netRowsById = {};
   var shown = ctx.netEntries.filter(netPasses);
   if (!shown.length) {
     netListEl.appendChild(h('.pdt-empty', ctx.netEntries.length ?
@@ -274,8 +338,67 @@ function renderNetList() {
     return;
   }
   var frag = document.createDocumentFragment();
-  for (var i = shown.length - 1; i >= 0; i--) frag.appendChild(netRow(shown[i]));
+  for (var i = shown.length - 1; i >= 0; i--) {
+    var row = netRow(shown[i]);
+    netRowsById[shown[i].id] = row;
+    shown[i]._dirty = false;
+    frag.appendChild(row);
+  }
   netListEl.appendChild(frag);
+}
+
+function netSyncList() {
+  if (!netListEl) return;
+  /* evict rows whose entry fell out of the ring buffer (entries are spliced
+   * from the front, so anything older than the oldest live id is stale) */
+  var minLive = ctx.netEntries.length ? ctx.netEntries[0].id : Infinity;
+  for (var k in netRowsById) {
+    if (Number(k) < minLive) {
+      var rm = netRowsById[k];
+      if (rm && rm.parentNode) rm.parentNode.removeChild(rm);
+      delete netRowsById[k];
+    }
+  }
+  /* patch changed rows (pending -> done, size/duration updates) */
+  for (var i = 0; i < ctx.netEntries.length; i++) {
+    var e = ctx.netEntries[i];
+    var row = netRowsById[e.id];
+    if (row && e._dirty) {
+      var nu = netRow(e);
+      netRowsById[e.id] = nu;
+      e._dirty = false;
+      if (row.parentNode) row.parentNode.replaceChild(nu, row);
+    }
+  }
+  /* prepend new rows — newest first, like the full render */
+  var frag = null;
+  for (var j = 0; j < ctx.netEntries.length; j++) {
+    var en = ctx.netEntries[j];
+    if (!netRowsById[en.id] && netPasses(en)) {
+      var r = netRow(en);
+      netRowsById[en.id] = r;
+      en._dirty = false;
+      if (!frag) frag = document.createDocumentFragment();
+      frag.insertBefore(r, frag.firstChild);
+    }
+  }
+  if (frag) {
+    var emp = netListEl.querySelector('.pdt-empty');
+    if (emp) emp.remove();
+    netListEl.insertBefore(frag, netListEl.firstChild);
+  }
+  /* hard DOM cap — the buffer holds 300, so does the list */
+  while (netListEl.children.length > 300) {
+    var last = netListEl.lastChild;
+    if (!last) break;
+    netListEl.removeChild(last);
+  }
+  if (!netListEl.children.length) {
+    netListEl.appendChild(h('.pdt-empty', ctx.netEntries.length ?
+      'No requests match the current filter' :
+      'No requests captured yet.\nRequests made after DevTools loaded appear here.'));
+  }
+  if (netCountEl) netCountEl.textContent = ctx.netEntries.length + ' req';
 }
 
 function netRow(e) {
@@ -295,7 +418,8 @@ function netRow(e) {
     h('span.m', (e.duration != null ? fmtMs(e.duration) : '—') + ' · ' + (e.size != null ? fmtBytes(e.size) : '—'))
   ]);
   var row = h('.pdt-nrow2', [left, right]);
-  row.addEventListener('click', function () { netDetailId = e.id; renderNetDetail(); });
+  try { row.dataset.nid = e.id; } catch (er) { /* noop */ }
+  row.addEventListener('click', safe(function () { netDetailId = e.id; renderNetDetail(); }, 'netRow.click'));
   return row;
 }
 
@@ -469,8 +593,9 @@ function renderNetPanel() {
   });
   var search = h('input.pdt-input.pdt-grow', { type: 'search', placeholder: 'Filter URL' });
   search.addEventListener('input', debounce(function () { netSearchVal = search.value; renderNetList(); }, 200));
-  var count = h('span', { style: { color: 'var(--muted)', fontSize: '.85em', flex: 'none' } },
+  netCountEl = h('span', { style: { color: 'var(--muted)', fontSize: '.85em', flex: 'none' } },
     ctx.netEntries.length + ' req');
+  var count = netCountEl;
 
   var pauseBtn = h('button.pdt-ib', { type: 'button', title: ctx.netPaused ? 'Resume capture' : 'Pause capture' }, iconEl(ctx.netPaused ? 'play' : 'pause'));
   pauseBtn.addEventListener('click', function () {
@@ -488,7 +613,7 @@ function renderNetPanel() {
   panel.appendChild(h('.pdt-toolbar', [
     chips.all, chips.xhr, chips.fetch, chips.ws, search, count, pauseBtn, blockBtn,
     h('button.pdt-ib', { type: 'button', title: 'Export HAR', onclick: exportHar }, iconEl('save')),
-    h('button.pdt-ib', { type: 'button', title: 'Clear', onclick: function () { ctx.netEntries = []; renderNetPanel(); } }, iconEl('trash'))
+    h('button.pdt-ib', { type: 'button', title: 'Clear', onclick: function () { ctx.netEntries = []; netRowsById = {}; renderNetPanel(); } }, iconEl('trash'))
   ]));
   netListEl = h('.pdt-scroll', { style: { padding: '0' } });
   panel.appendChild(netListEl);

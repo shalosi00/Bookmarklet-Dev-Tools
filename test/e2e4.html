@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDT v5.2 E2E Stability Suite</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 16px; background: #f5f5f0; color: #222; }
+  .box { background: #4a90d9; color: #fff; padding: 24px; margin: 16px 0; border-radius: 8px; }
+  #target { border: 3px solid #333; padding: 20px; color: #333; background: #eef; }
+</style>
+</head>
+<body>
+<h1>Stability Suite (v5.2)</h1>
+<div class="box" id="main-box">Main box <span id="inner">inner span</span></div>
+<div id="target"><p>Tap target</p></div>
+<script>
+  /* ---- harness + PRE-INJECTION native references (must run before src.js) ---- */
+  window.__RESULTS = [];
+  window.__DONE = false;
+  window.__PRE__ = {
+    log: console.log,
+    fetch: window.fetch,
+    xhrSend: XMLHttpRequest.prototype.send,
+    xhrOpen: XMLHttpRequest.prototype.open,
+    ws: window.WebSocket,
+    ael: EventTarget.prototype.addEventListener
+  };
+  window.__xssHit = false;
+  try { localStorage.setItem('xss-ls', '<img src=x onerror="window.__xssHit=1"><svg onload="window.__xssHit=1"></svg>'); } catch (e) {}
+  try { localStorage.setItem('stab-ls', JSON.stringify({ a: 1 })); } catch (e) {}
+  function T(name, fn) {
+    var rec = { name: name, pass: null, info: '' };
+    window.__RESULTS.push(rec);
+    try {
+      var r = fn();
+      rec.pass = r === true || r === undefined;
+      if (r !== true && r !== undefined) rec.info = String(r);
+    } catch (e) { rec.pass = false; rec.info = 'EXCEPTION: ' + (e && e.message || e); }
+  }
+  function AT(name, fn) {
+    var rec = { name: name, pass: null, info: '' };
+    window.__RESULTS.push(rec);
+    window.__CHAIN = (window.__CHAIN || Promise.resolve()).then(function () {
+      return Promise.resolve().then(fn);
+    }).then(function (v) {
+      rec.pass = v === true;
+      if (v !== true) rec.info = String(v);
+    }, function (e) { rec.pass = false; rec.info = 'REJECT: ' + (e && e.message || e); });
+  }
+  window.__summary = function () {
+    var pass = 0, fail = 0, failed = [];
+    window.__RESULTS.forEach(function (r) {
+      if (r.pass === true) pass++;
+      else { fail++; failed.push(r.name + ' :: ' + r.info); }
+      if (r.pass === null) { fail++; failed.push(r.name + ' :: (never resolved)'); }
+    });
+    return { total: window.__RESULTS.length, pass: pass, fail: fail, failed: failed };
+  };
+</script>
+
+<!-- the bookmarklet build under test -->
+<script src="../src.js"></script>
+<script>
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  var P = null;
+  function R(code) { var r = P.run(code); return r && r.ok ? r.value : ('ERR:' + (r && r.value)); }
+  function panel() { return P._app().querySelector('.pdt-panel.on'); }
+  function app() { return P._app(); }
+  function sub(label) {
+    var btns = panel().querySelectorAll('.pdt-subb');
+    for (var i = 0; i < btns.length; i++) {
+      if (btns[i].textContent.toLowerCase().indexOf(label.toLowerCase()) >= 0) { btns[i].click(); return true; }
+    }
+    return false;
+  }
+
+  function runSuite() {
+    P = window.__POCKET_DEVTOOLS__;
+    if (!P) { window.__DONE = true; return; }
+    window.__CHAIN = Promise.resolve();
+
+    /* ================= A. boot ================= */
+    T('A1 version 5.3.0', function () { return P.version === '5.3.0' || 'v=' + P.version; });
+    T('A2 single host element', function () {
+      return document.querySelectorAll('#pdt-host').length === 1 || 'hosts=' + document.querySelectorAll('#pdt-host').length;
+    });
+    T('A3 all hooks active (diagnostics)', function () {
+      var d = P.diagnostics();
+      return (d.hooks.console === 'active' && d.hooks.fetch === 'active' && d.hooks.xhr === 'active' &&
+        d.hooks.websocket === 'active' && d.hooks.listenerCapture === 'active') ||
+        JSON.stringify(d.hooks);
+    });
+    T('A4 stylesheet applied', function () {
+      return P.diagnostics().stylesheet === 'applied' || P.diagnostics().stylesheet;
+    });
+    T('A5 storage writable', function () {
+      var s = P.diagnostics().storage;
+      return s.localStorage === 'writable' && s.sessionStorage === 'writable' || JSON.stringify(s);
+    });
+    T('A6 errors() is an array', function () { return Array.isArray(P.errors()); });
+
+    /* ================= B. hostile objects must never throw ================= */
+    T('B1 revoked proxy in console.log', function () {
+      var pr = Proxy.revocable({ a: 1 }, {});
+      pr.revoke();
+      console.log('revoked:', pr.proxy);
+      return true;
+    });
+    T('B2 throwing getters in console.log', function () {
+      var hostile = {};
+      Object.defineProperty(hostile, 'boom', { get: function () { throw new Error('getter boom'); } });
+      console.log('hostile:', hostile);
+      return true;
+    });
+    T('B3 circular object in console.log', function () {
+      var a = { name: 'circ' }; a.self = a;
+      console.log('circular:', a);
+      return true;
+    });
+    T('B4 huge string truncated (200 KB)', function () {
+      var big = new Array(200001).join('x');
+      console.log('big:', big);
+      var e = P.entries();
+      var last = e[e.length - 1];
+      return last && last.text.length < 10500 || 'len=' + (last && last.text.length);
+    });
+    T('B5 hostile console.table', function () {
+      var hostile = {};
+      Object.defineProperty(hostile, 'k', { get: function () { throw new Error('tbl'); } });
+      console.table(hostile);
+      console.table([1, 2, { a: 1 }]);       /* normal table still fine */
+      return true;
+    });
+    T('B6 hostile console.time label', function () {
+      var hostile = { toString: function () { throw new Error('label'); } };
+      console.time(hostile);
+      console.timeEnd(hostile);
+      return true;
+    });
+    T('B7 hostile getter object logged is inspectable (kind detection safe)', function () {
+      var hostile = {};
+      Object.defineProperty(hostile, 'x', { get: function () { throw 1; } });
+      var r = P.run('JSON.stringify({ok: "yes"})');
+      return r.ok === true;
+    });
+    AT('B8 unhandledrejection with hostile reason — no loop, page alive', function () {
+      var bad = {};
+      Object.defineProperty(bad, 'stack', { get: function () { throw new Error('stack'); } });
+      Promise.reject(bad);
+      return sleep(400).then(function () {
+        return P.run('2+2').value === 4;
+      });
+    });
+    T('B9 tool fully functional after hostile barrage', function () {
+      return P.run('6*7').value === 42;
+    });
+    T('B10 hostile entries were captured (not lost)', function () {
+      var txt = P.entries().map(function (e) { return e.text; }).join('\n');
+      return txt.indexOf('revoked') >= 0 && txt.indexOf('circular') >= 0 || txt.slice(0, 120);
+    });
+
+    /* ================= C. XSS safety ================= */
+    AT('C1 storage value with HTML payload renders escaped', function () {
+      P.tab('storage');
+      return sleep(80).then(function () {
+        sub('local');
+        return sleep(120);
+      }).then(function () {
+        var sc = panel().querySelector('.pdt-scroll') || panel();
+        var txt = sc.textContent || '';
+        return sleep(400);
+      }).then(function () {
+        if (window.__xssHit) return 'XSS EXECUTED';
+        return txtIndexOf();
+        function txtIndexOf() {
+          var sc = panel().querySelector('.pdt-scroll') || panel();
+          return (sc.textContent || '').indexOf('xss-ls') >= 0 || 'xss-ls row not shown';
+        }
+      });
+    });
+    T('C2 console.log of script tag does not execute', function () {
+      console.log('<svg onload="window.__xssHit=1"></svg>');
+      return window.__xssHit === false;
+    });
+    AT('C3 no delayed XSS execution', function () {
+      return sleep(400).then(function () { return window.__xssHit === false || 'XSS EXECUTED'; });
+    });
+
+    /* ================= D. network robustness ================= */
+    AT('D1 fetch to invalid URL — captured, no crash', function () {
+      return fetch('http://[::invalid-host]').then(function () {
+        return 'should have rejected';
+      }, function (err) {
+        return sleep(150).then(function () {
+          var reqs = P.requests();
+          var bad = reqs.filter(function (r) { return r.url.indexOf('invalid-host') >= 0; });
+          return bad.length >= 1 && bad[0].error != null || 'captured=' + JSON.stringify(bad.map(function (b) { return { e: b.error }; }));
+        });
+      });
+    });
+    AT('D2 XHR to invalid URL — captured, no crash', function () {
+      return new Promise(function (resolve) {
+        var x = new XMLHttpRequest();
+        x.open('GET', 'http://invalid.domain.invalid.e2e/x');
+        try { x.send(); } catch (e) { /* sync throw possible — also fine */ }
+        setTimeout(function () {
+          var reqs = P.requests();
+          var bad = reqs.filter(function (r) { return r.url.indexOf('invalid.domain') >= 0; });
+          resolve(bad.length >= 1 || 'not captured');
+        }, 300);
+      });
+    });
+    AT('D3 incremental net rendering (data-nid rows + counter)', function () {
+      P.tab('network');
+      return sleep(100).then(function () {
+        return fetch('data.json').then(function () { return fetch('data.json'); });
+      }).then(function () {
+        return sleep(250).then(function () {
+          var rows = panel().querySelectorAll('.pdt-nrow2');
+          var nids = 0;
+          rows.forEach(function (r) { if (r.dataset && r.dataset.nid) nids++; });
+          if (!rows.length) return 'no rows rendered';
+          if (rows.length !== nids) return 'rows without nid: ' + rows.length + '/' + nids;
+          var counter = panel().textContent.match(/(\d+) req/);
+          var cnt = counter ? parseInt(counter[1], 10) : 0;
+          return cnt >= 2 || 'counter=' + cnt;
+        });
+      });
+    });
+    AT('D4 one more request prepends without full re-render', function () {
+      var before = panel().querySelectorAll('.pdt-nrow2').length;
+      return fetch('data.json').then(function () {
+        return sleep(250).then(function () {
+          var after = panel().querySelectorAll('.pdt-nrow2').length;
+          return after === before + 1 || 'before=' + before + ' after=' + after;
+        });
+      });
+    });
+
+    /* ================= E. caps ================= */
+    AT('E1 console ring buffer caps at maxConsole', function () {
+      var cap = 500; /* default */
+      for (var i = 0; i < 600; i++) console.log('cap-test-' + i);
+      return sleep(150).then(function () {
+        var n = P.entries().length;
+        return n <= cap || 'entries=' + n + ' > cap ' + cap;
+      });
+    });
+    T('E2 console DOM rows capped', function () {
+      P.tab('console');
+      var log = panel().querySelector('.pdt-clog');
+      return (log && log.children.length <= 500) || 'rows=' + (log && log.children.length);
+    });
+
+    /* ================= F. restart / destroy / re-inject ================= */
+    AT('F1 restartUI rebuilds without losing hooks', function () {
+      var hostsBefore = document.querySelectorAll('#pdt-host').length;
+      P.restartUI();
+      return sleep(150).then(function () {
+        var hosts = document.querySelectorAll('#pdt-host').length;
+        if (hosts !== 1) return 'hosts=' + hosts + ' (before ' + hostsBefore + ')';
+        if (console.log === window.__PRE__.log) return 'console unhooked by restart';
+        P.tab('console');
+        console.log('after-restart');
+        return sleep(100).then(function () {
+          var txt = P.entries().map(function (e) { return e.text; }).join('\n');
+          return txt.indexOf('after-restart') >= 0 || 'capture lost after restart';
+        });
+      });
+    });
+    AT('F2 restartUI keeps settings panel working', function () {
+      P.tab('settings');
+      return sleep(120).then(function () {
+        var txt = panel().textContent || '';
+        return (txt.indexOf('Diagnostics') >= 0 && txt.indexOf('Restart UI') >= 0) || 'diagnostics card missing';
+      });
+    });
+    AT('F3 destroy() restores every native', function () {
+      P.destroy();
+      return sleep(120).then(function () {
+        if (document.querySelector('#pdt-host')) return 'host still present';
+        if (window.__POCKET_DEVTOOLS__) return 'api still present';
+        if (console.log !== window.__PRE__.log) return 'console.log not restored';
+        if (window.fetch !== window.__PRE__.fetch) return 'fetch not restored';
+        if (XMLHttpRequest.prototype.send !== window.__PRE__.xhrSend) return 'XHR not restored';
+        if (XMLHttpRequest.prototype.open !== window.__PRE__.xhrOpen) return 'XHR.open not restored';
+        if (window.WebSocket !== window.__PRE__.ws) return 'WebSocket not restored';
+        if (EventTarget.prototype.addEventListener !== window.__PRE__.ael) return 'addEventListener not restored';
+        if (typeof window.$ !== 'undefined') return 'helper $ still defined';
+        if (typeof window.copy !== 'undefined') return 'helper copy still defined';
+        if (typeof window.$x !== 'undefined') return 'helper $x still defined';
+        return true;
+      });
+    });
+    AT('F4 page still healthy after destroy', function () {
+      console.log('post-destroy log works');
+      return fetch('data.json').then(function (r) {
+        return r.ok === true;
+      });
+    });
+    AT('F5 re-injection boots a fresh copy (full cycle)', function () {
+      var s = document.createElement('script');
+      s.src = '../src.js?reinject=' + Date.now();
+      document.head.appendChild(s);
+      return sleep(400).then(function () {
+        var P2 = window.__POCKET_DEVTOOLS__;
+        if (!P2) return 'no api after re-inject';
+        if (P2.version !== '5.3.0') return 'v=' + P2.version;
+        if (!document.querySelector('#pdt-host')) return 'no host';
+        P = P2;   /* the harness helpers now target the fresh instance */
+        P2.tab('console');
+        console.log('re-injected-ok');
+        return sleep(100).then(function () {
+          var txt = P2.entries().map(function (e) { return e.text; }).join('\n');
+          return txt.indexOf('re-injected-ok') >= 0 || 'capture broken on re-inject';
+        });
+      });
+    });
+    AT('F6 hostile objects still safe after re-injection', function () {
+      var P2 = window.__POCKET_DEVTOOLS__;
+      var pr = Proxy.revocable({}, {});
+      pr.revoke();
+      console.log('revoked2:', pr.proxy);
+      return P2.run('1+1').value === 2;
+    });
+
+    /* ================= G. diagnostics panel UI ================= */
+    AT('G1 diagnostics card shows hook health', function () {
+      var P2 = window.__POCKET_DEVTOOLS__;
+      P2.tab('settings');
+      return sleep(150).then(function () {
+        var txt = panel().textContent || '';
+        if (txt.indexOf('Diagnostics & health') < 0) return 'card missing';
+        if (txt.indexOf('active') < 0) return 'no hook status shown';
+        if (txt.indexOf('Internal errors caught') < 0) return 'error counter missing';
+        return true;
+      });
+    });
+    AT('G2 unhandled errors were recorded, not thrown', function () {
+      var P2 = window.__POCKET_DEVTOOLS__;
+      var errs = P2.errors();
+      return Array.isArray(errs) && errs.length <= 50 || 'count=' + errs.length;
+    });
+
+    window.__CHAIN.then(function () { window.__DONE = true; });
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { setTimeout(runSuite, 60); });
+  else setTimeout(runSuite, 60);
+</script>
+</body>
+</html>

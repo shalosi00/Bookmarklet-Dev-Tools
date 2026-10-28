@@ -15,7 +15,7 @@
     return;
   }
 
-  var VERSION = '5.1.0';
+  var VERSION = '5.3.0';
 
   /* Build flavour. The userscript edition (pocket-devtools.user.js) sets this
    * flag right before the core runs: capture starts at document-start and the
@@ -49,6 +49,7 @@
     return s;
   }
   var settings = loadSettings();
+  stab().diag.bootTime = Date.now();
 
   /* Userscript site exclusion — decided before any hook or UI is installed,
    * so excluded sites stay 100% untouched. */
@@ -70,7 +71,7 @@
   }
   /* The debounced write must survive a refresh/navigation — flush it on
    * pagehide so settings (last tab, toggles…) are never lost mid-debounce. */
-  window.addEventListener('pagehide', function () {
+  onEvt(window, 'pagehide', function () {
     clearTimeout(saveTimer);
     try { localStorage.setItem('pdt:settings', JSON.stringify(settings)); } catch (e) { /* noop */ }
   });
@@ -111,6 +112,7 @@
     selHistory: [],                 /* $0 .. $4 — last 5 selected elements */
     lastResult: undefined,          /* $_ — result of last console command */
     activeTab: (settings.lastTab && /^[a-z]+$/.test(settings.lastTab)) ? settings.lastTab : 'console',
+    fabHidden: false,               /* FAB hidden via its × badge (this load only) */
     netEntries: [], netSeq: 0, netPaused: false,
     conEntries: [], conRendered: 0,
     conFilters: { log: true, info: true, warn: true, error: true, debug: true },

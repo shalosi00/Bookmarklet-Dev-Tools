@@ -1,12 +1,26 @@
 /*
- * 16-footer.js — boot sequence and public API
+ * 19-footer.js — boot sequence and public API
  */
+
+/* Drop every module-level element reference so a rebuilt shell starts clean.
+ * All names live in the shared IIFE scope, so this one function can reset
+ * them all. Used by restartUI() and destroyTool(). */
+function resetPanelRefs() {
+  hostEl = root = app = sheetEl = tabsEl = bodyEl = fabEl = null;
+  panelEls = {};
+  conListEl = null; conInputEl = null;
+  netListEl = null; netDetailId = null; netCountEl = null; netRowsById = {};
+  elTreeEl = elDetailEl = elEvEl = null;
+  fpsNumEl = fpsCanvasEl = null;
+  ctx.conRendered = 0;
+}
 
 function start() {
   document.removeEventListener('DOMContentLoaded', start);
   try {
     buildShell();
   } catch (e) {
+    pdError(e, 'boot');
     try { nativeCon.error && nativeCon.error('Pocket DevTools failed to start: ' + (e && (e.message || e))); } catch (e2) { /* noop */ }
     return;
   }
@@ -22,7 +36,7 @@ function boot() {
    * installed (they run at script evaluation, before this line). The UI needs
    * a parsed document, so defer the shell until the DOM is ready. */
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', start);
+    document.addEventListener('DOMContentLoaded', safe(start, 'DOMContentLoaded'));
     return;
   }
   start();
@@ -35,6 +49,8 @@ window.__POCKET_DEVTOOLS__ = {
   toggle: function () { toggleSheet(); },
   open: function () { openSheet(); },
   close: function () { closeSheet(); },
+  hideFab: function () { hideFab(true); return 'Floating icon hidden for this page load'; },
+  showFab: function () { showFab(); return 'Floating icon restored'; },
   inspect: function () { toggleInspect(); },
   select: function (el) { selectElement(el); },
   tab: function (id) { switchTab(id); },
@@ -58,10 +74,15 @@ window.__POCKET_DEVTOOLS__ = {
   blocklist: function () { return ctx.blockList.slice(); },
   $0: function () { return ctx.selected; },
   clearConsole: conClear,
+  /* --- stability API (v5.2) --- */
+  diagnostics: function () { return collectDiagnostics(); },
+  errors: function () { return stab().errors.slice(); },
+  restartUI: function () { restartUI(); return 'UI restarted'; },
+  destroy: function () { destroyTool(); return 'Pocket DevTools unloaded'; },
   /* debug/testing handle */
   _app: function () { return app; },
   _dump: function () {
-    var active = app.querySelector('.pdt-panel.on');
+    var active = app ? app.querySelector('.pdt-panel.on') : null;
     return JSON.stringify({
       activeTab: ctx.activeTab,
       panels: Object.keys(panelEls),

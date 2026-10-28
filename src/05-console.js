@@ -8,9 +8,12 @@
  */
 
 var nativeCon = {};
-['log', 'info', 'warn', 'error', 'debug', 'table', 'time', 'timeEnd', 'timeLog',
- 'count', 'countReset', 'group', 'groupCollapsed', 'groupEnd', 'trace', 'dir',
- 'assert', 'clear'].forEach(function (m) {
+var CON_METHODS = ['log', 'info', 'warn', 'error', 'debug', 'table', 'time', 'timeEnd', 'timeLog',
+  'count', 'countReset', 'group', 'groupCollapsed', 'groupEnd', 'trace', 'dir',
+  'assert', 'clear'];
+CON_METHODS.forEach(function (m) {
+  /* save the exact own-property descriptor so destroyTool() can restore it */
+  try { natives.conDesc[m] = Object.getOwnPropertyDescriptor(console, m); } catch (e) { natives.conDesc[m] = null; }
   nativeCon[m] = (typeof console[m] === 'function') ? console[m].bind(console) : function () {};
 });
 
@@ -27,7 +30,9 @@ function conEmit(level, args, kind, extra) {
   /* keep raw values for the object inspector (first expandable arg only) */
   if (!entry.vals) {
     for (var j = 0; j < args.length && j < 4; j++) {
-      if (args[j] && isExpandable(args[j])) { entry.val = args[j]; break; }
+      if (args[j] && typeof args[j] === 'object') {
+        try { if (isExpandable(args[j])) { entry.val = args[j]; break; } } catch (e) { /* hostile object */ }
+      }
     }
   }
   var last = ctx.conEntries[ctx.conEntries.length - 1];
@@ -40,7 +45,7 @@ function conEmit(level, args, kind, extra) {
       ctx.conEntries.splice(0, ctx.conEntries.length - settings.maxConsole);
     }
   }
-  conRenderNew();
+  try { conRenderNew(); } catch (e) { pdError(e, 'conRender'); }
 }
 
 function conEcho(kind, text) {
@@ -48,112 +53,148 @@ function conEcho(kind, text) {
   conRenderNew();
 }
 
-/* patch the whole console API (runs at script load) */
+/* patch the whole console API (runs at script load).
+ * Every patched method: our capture logic runs inside safe() so a hostile
+ * argument (throwing getters, revoked proxies, …) can NEVER make the page's
+ * console call throw — and the native console still receives everything. */
 (function installConsoleCapture() {
   function patch(method, fn) {
     try {
       Object.defineProperty(console, method, {
         value: fn, writable: true, configurable: true
       });
+      stab().diag.console = true;
     } catch (e) { /* some pages lock console */ }
   }
   ['log', 'info', 'warn', 'error', 'debug'].forEach(function (m) {
-    patch(m, function () { conEmit(m, arguments); nativeCon[m].apply(null, arguments); });
+    patch(m, function () {
+      var a = arguments;
+      safe(function () { conEmit(m, a); }, 'console.' + m)();
+      return nativeCon[m].apply(null, a);
+    });
   });
 
   patch('table', function (data, props) {
-    var tbl = buildTableData(data, props);
-    if (tbl) conEmit('log', [tbl.caption || 'console.table'], '', { table: tbl });
-    else conEmit('warn', ['console.table: data must be an array or object']);
+    safe(function () {
+      var tbl = null;
+      try { tbl = buildTableData(data, props); } catch (e) { tbl = null; }
+      if (tbl) conEmit('log', [tbl.caption || 'console.table'], '', { table: tbl });
+      else conEmit('warn', ['console.table: data must be an array or object']);
+    }, 'console.table')();
     try { nativeCon.table(data, props); } catch (e) { /* noop */ }
   });
 
   patch('time', function (label) {
-    label = label || 'default';
-    if (ctx.conTimers[label] != null) conEmit('warn', ['Timer "' + label + '" already exists']);
-    else ctx.conTimers[label] = netNow();
+    safe(function () {
+      var lb = label || 'default';
+      if (ctx.conTimers[lb] != null) conEmit('warn', ['Timer "' + lb + '" already exists']);
+      else ctx.conTimers[lb] = netNow();
+    }, 'console.time')();
     try { nativeCon.time(label); } catch (e) { /* noop */ }
   });
-  function timerEmit(method, label) {
-    label = label || 'default';
-    var t0 = ctx.conTimers[label];
-    if (t0 == null) { conEmit('warn', ['Timer "' + label + '" does not exist']); return null; }
+  function timerEmit(label) {
+    var lb = label || 'default';
+    var t0 = ctx.conTimers[lb];
+    if (t0 == null) { conEmit('warn', ['Timer "' + lb + '" does not exist']); return null; }
     return fmtMs(netNow() - t0);
   }
   patch('timeLog', function (label) {
-    var ms = timerEmit('timeLog', label);
-    if (ms != null) { conEmit('log', [(label || 'default') + ': ' + ms]); try { nativeCon.timeLog(label); } catch (e) { /* noop */ } }
+    safe(function () {
+      var ms = timerEmit(label);
+      if (ms != null) conEmit('log', [(label || 'default') + ': ' + ms]);
+    }, 'console.timeLog')();
+    try { nativeCon.timeLog(label); } catch (e) { /* noop */ }
   });
   patch('timeEnd', function (label) {
-    var ms = timerEmit('timeEnd', label);
-    if (ms != null) {
-      delete ctx.conTimers[label];
-      conEmit('log', [(label || 'default') + ': ' + ms]);
-      try { nativeCon.timeEnd(label); } catch (e) { /* noop */ }
-    }
+    safe(function () {
+      var ms = timerEmit(label);
+      if (ms != null) {
+        delete ctx.conTimers[label || 'default'];
+        conEmit('log', [(label || 'default') + ': ' + ms]);
+      }
+    }, 'console.timeEnd')();
+    try { nativeCon.timeEnd(label); } catch (e) { /* noop */ }
   });
 
   patch('count', function (label) {
-    label = label || 'default';
-    ctx.conCounters[label] = (ctx.conCounters[label] || 0) + 1;
-    conEmit('log', [label + ': ' + ctx.conCounters[label]]);
+    safe(function () {
+      var lb = label || 'default';
+      ctx.conCounters[lb] = (ctx.conCounters[lb] || 0) + 1;
+      conEmit('log', [lb + ': ' + ctx.conCounters[lb]]);
+    }, 'console.count')();
     try { nativeCon.count(label); } catch (e) { /* noop */ }
   });
   patch('countReset', function (label) {
-    label = label || 'default';
-    delete ctx.conCounters[label];
+    safe(function () { delete ctx.conCounters[label || 'default']; }, 'console.countReset')();
     try { nativeCon.countReset(label); } catch (e) { /* noop */ }
   });
 
   function groupPatch(method, collapsed) {
     patch(method, function () {
-      var label = (arguments.length && serialize(arguments[0], 0)) || 'group';
-      conEmit('log', ['\u25BE ' + label], '', { group: collapsed ? 'collapsed' : 'open' });
-      ctx.groupDepth++;
-      try { nativeCon[method].apply(null, arguments); } catch (e) { /* noop */ }
+      var a = arguments;
+      safe(function () {
+        var label = (a.length && serialize(a[0], 0)) || 'group';
+        conEmit('log', ['\u25BE ' + label], '', { group: collapsed ? 'collapsed' : 'open' });
+        ctx.groupDepth++;
+      }, 'console.' + method)();
+      try { nativeCon[method].apply(null, a); } catch (e) { /* noop */ }
     });
   }
   groupPatch('group', false);
   groupPatch('groupCollapsed', true);
   patch('groupEnd', function () {
-    ctx.groupDepth = Math.max(0, ctx.groupDepth - 1);
+    safe(function () { ctx.groupDepth = Math.max(0, ctx.groupDepth - 1); }, 'console.groupEnd')();
     try { nativeCon.groupEnd(); } catch (e) { /* noop */ }
   });
 
   patch('trace', function () {
-    var stack = '';
-    try { stack = String(new Error().stack || '').split('\n').slice(1, 7).join('\n'); } catch (e) { /* noop */ }
-    var msg = arguments.length ? Array.prototype.map.call(arguments, function (a) { return serialize(a, 0); }).join(' ') : 'console.trace';
-    conEmit('log', [msg], '', { stack: stack || '(stack unavailable)' });
+    var a = arguments;
+    safe(function () {
+      var stack = '';
+      try { stack = String(new Error().stack || '').split('\n').slice(1, 7).join('\n'); } catch (e) { /* noop */ }
+      var msg = a.length ? Array.prototype.map.call(a, function (x) { return serialize(x, 0); }).join(' ') : 'console.trace';
+      conEmit('log', [msg], '', { stack: stack || '(stack unavailable)' });
+    }, 'console.trace')();
     try { nativeCon.trace(); } catch (e) { /* noop */ }
   });
 
   patch('dir', function (obj) {
-    conEmit('log', [obj], 'dir');
+    safe(function () { conEmit('log', [obj], 'dir'); }, 'console.dir')();
     try { nativeCon.dir(obj); } catch (e) { /* noop */ }
   });
   patch('assert', function (cond) {
-    if (!cond) {
-      var rest = Array.prototype.slice.call(arguments, 1);
-      conEmit('error', ['Assertion failed: ' + (rest.length ? rest.map(function (a) { return serialize(a, 0); }).join(' ') : 'console.assert')]);
-    }
-    try { nativeCon.assert.apply(null, arguments); } catch (e) { /* noop */ }
+    var a = arguments;
+    safe(function () {
+      if (!cond) {
+        var rest = Array.prototype.slice.call(a, 1);
+        conEmit('error', ['Assertion failed: ' + (rest.length ? rest.map(function (x) { return serialize(x, 0); }).join(' ') : 'console.assert')]);
+      }
+    }, 'console.assert')();
+    try { nativeCon.assert.apply(null, a); } catch (e) { /* noop */ }
   });
   patch('clear', function () {
-    conClear();
+    safe(conClear, 'console.clear')();
     try { nativeCon.clear(); } catch (e) { /* noop */ }
   });
 
-  window.addEventListener('error', function (ev) {
-    if (ev.message && ev.message.indexOf('pdt-host') >= 0) return; /* our own UI errors — ignore spillover */
-    var loc = '';
-    try { if (ev.filename) loc = ' @ ' + String(ev.filename).split('/').pop() + ':' + ev.lineno; } catch (e) { /* noop */ }
-    conEmit('error', [(ev.message || 'Script error') + loc]);
+  /* window error handlers — wrapped so a hostile error reason can never
+   * start an error -> handler -> error loop */
+  onEvt(window, 'error', function (ev) {
+    safe(function () {
+      if (ev && ev.message && String(ev.message).indexOf('pdt-host') >= 0) return; /* our own UI errors */
+      var loc = '';
+      try { if (ev.filename) loc = ' @ ' + String(ev.filename).split('/').pop() + ':' + ev.lineno; } catch (e) { /* noop */ }
+      conEmit('error', [((ev && ev.message) || 'Script error') + loc]);
+    }, 'window.onerror')();
   }, true);
-  window.addEventListener('unhandledrejection', function (ev) {
-    var r = ev.reason;
-    var msg = (r && (r.stack || r.message)) || String(r);
-    conEmit('error', ['Unhandled promise rejection: ' + msg]);
+  onEvt(window, 'unhandledrejection', function (ev) {
+    safe(function () {
+      var r = ev && ev.reason;
+      var msg;
+      try { msg = (r && (r.stack || r.message)) || String(r); }
+      catch (e) { msg = '(unserializable rejection reason)'; }
+      conEmit('error', ['Unhandled promise rejection: ' + msg]);
+    }, 'unhandledrejection')();
   });
 
   installConsoleHelpers();
@@ -278,11 +319,15 @@ function conEntryNode(entry) {
   if (entry.depth) row.style.paddingLeft = (10 + entry.depth * 16) + 'px';
   if (entry.group) { row.classList.add('group-head'); }
 
-  /* object inspector toggle */
-  if (entry.val && isExpandable(entry.val)) {
-    var toggle = h('button.pdt-otog', objPreview(entry.val));
+  /* object inspector toggle — hostile values must never break rendering */
+  var hasVal = false;
+  try { hasVal = !!(entry.val && isExpandable(entry.val)); } catch (e) { hasVal = false; }
+  if (hasVal) {
+    var pv = '{…}';
+    try { pv = objPreview(entry.val); } catch (e) { /* hostile */ }
+    var toggle = h('button.pdt-otog', pv);
     var built = false;
-    toggle.addEventListener('click', function (e) {
+    toggle.addEventListener('click', safe(function (e) {
       e.stopPropagation();
       if (!built) {
         built = true;
@@ -293,23 +338,25 @@ function conEntryNode(entry) {
           if (kind === 'array' || kind === 'object') {
             var keys = kind === 'array' ? entry.val.map(function (_, i) { return String(i); }) : Object.keys(entry.val);
             keys.slice(0, 100).forEach(function (k) { pairs.push([k, kind === 'array' ? entry.val[Number(k)] : entry.val[k]]); });
-          } else if (kind === 'map') { entry.val.forEach(function (v, k) { pairs.push([serialize(k, 1), v]); }); }
-          else if (kind === 'set') { entry.val.forEach(function (v, i) { pairs.push([String(i), v]); }); }
+          } else if (kind === 'map') { entry.val.forEach(function (v, k) { if (pairs.length < 100) pairs.push([serialize(k, 1), v]); }); }
+          else if (kind === 'set') { entry.val.forEach(function (v, i) { if (pairs.length < 100) pairs.push([String(i), v]); }); }
         } catch (e2) { /* locked */ }
         pairs.forEach(function (p) { wrap.appendChild(objTreeNode(p[0], p[1], 0)); });
         x.appendChild(wrap);
         toggle.classList.add('open');
-        toggle.textContent = '\u25BE ' + objPreview(entry.val);
+        var t2 = '{…}'; try { t2 = objPreview(entry.val); } catch (e3) { /* hostile */ }
+        toggle.textContent = '\u25BE ' + t2;
       } else {
         var tr = x.querySelector('.pdt-otree');
         if (tr) {
           var show = tr.style.display === 'none';
           tr.style.display = show ? '' : 'none';
           toggle.classList.toggle('open', show);
-          toggle.textContent = (show ? '\u25BE ' : '\u25B8 ') + objPreview(entry.val);
+          var t3 = '{…}'; try { t3 = objPreview(entry.val); } catch (e4) { /* hostile */ }
+          toggle.textContent = (show ? '\u25BE ' : '\u25B8 ') + t3;
         }
       }
-    });
+    }, 'con.inspect'));
     x.appendChild(toggle);
   }
   if (!conPassesFilter(entry)) row.classList.add('hide');
@@ -326,7 +373,10 @@ function conRenderNew() {
   if (!conListEl) return;
   var nearBottom = conListEl.scrollHeight - conListEl.scrollTop - conListEl.clientHeight < 60;
   var frag = document.createDocumentFragment();
-  for (var i = ctx.conRendered; i < ctx.conEntries.length; i++) frag.appendChild(conEntryNode(ctx.conEntries[i]));
+  for (var i = ctx.conRendered; i < ctx.conEntries.length; i++) {
+    try { frag.appendChild(conEntryNode(ctx.conEntries[i])); }
+    catch (e) { pdError(e, 'conNode'); }   /* one bad entry must not kill the batch */
+  }
   ctx.conRendered = ctx.conEntries.length;
   conListEl.appendChild(frag);
   while (conListEl.children.length > settings.maxConsole) conListEl.removeChild(conListEl.firstChild);

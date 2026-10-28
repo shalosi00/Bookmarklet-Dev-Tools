@@ -92,11 +92,16 @@ function renderSettingsPanel() {
   /* --- FAB --- */
   var fabRow = h('.pdt-card', [
     kv('Show floating button', settings.showFAB ? 'on' : 'off'),
-    h('button.pdt-btn' + (settings.showFAB ? '.on' : ''), { type: 'button', style: { marginTop: '8px' } }, settings.showFAB ? 'Hide FAB' : 'Show FAB')
+    h('.pdt-mtext', { style: { fontSize: '.82em', marginTop: '6px' } },
+      'Tap the icon to open the tools; drag it anywhere. Its small \u00D7 badge hides it ' +
+      'for the current page load \u2014 refreshing or re-tapping the bookmarklet brings it back. ' +
+      'The switch below is permanent (survives refresh).'),
+    h('button.pdt-btn' + (settings.showFAB ? '.on' : ''), { type: 'button', style: { marginTop: '8px' } }, settings.showFAB ? 'Hide FAB permanently' : 'Show FAB')
   ]);
   var fabBtn = fabRow.querySelector('button');
   fabBtn.addEventListener('click', function () {
     settings.showFAB = !settings.showFAB;
+    ctx.fabHidden = false;
     saveSettings();
     positionFab();
     renderSettingsPanel();
@@ -209,6 +214,47 @@ function renderSettingsPanel() {
       copyText('Pocket DevTools v' + VERSION + '\n' + location.href + '\n' + navigator.userAgent);
     } }, [iconEl('copy', 14), 'Copy diagnostics'])
   ]));
+
+  /* --- diagnostics & health --- */
+  sc.appendChild(h('.pdt-label', [iconEl('shield', 14), ' Diagnostics & health']));
+  var diagCard = h('.pdt-card');
+  var D = collectDiagnostics();
+  diagCard.appendChild(kv('Hooks (console / fetch / XHR)',
+    D.hooks.console + ' / ' + D.hooks.fetch + ' / ' + D.hooks.xhr));
+  diagCard.appendChild(kv('Hooks (WS / beacon / listeners)',
+    D.hooks.websocket + ' / ' + D.hooks.sendBeacon + ' / ' + D.hooks.listenerCapture));
+  diagCard.appendChild(kv('Stylesheet', D.stylesheet));
+  diagCard.appendChild(kv('Storage (local / session / cookies)',
+    D.storage.localStorage + ' / ' + D.storage.sessionStorage + ' / ' + D.storage.cookies));
+  diagCard.appendChild(kv('Captured (console / network / listeners)',
+    D.captured.consoleEntries + ' / ' + D.captured.networkEntries + ' / ' + D.captured.domListeners));
+  diagCard.appendChild(kv('Internal errors caught', String(D.internalErrors.count)));
+  diagCard.appendChild(kv('JS heap', D.jsHeap));
+  diagCard.appendChild(kv('Uptime', D.uptime));
+  if (D.internalErrors.count) {
+    var errList = h('pre.pdt-mono', { style: { fontSize: '.78em', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--fg2)', margin: '6px 0 0' } });
+    errList.textContent = D.internalErrors.last.map(function (er) {
+      return '[' + fmtTime(er.t) + '] ' + er.where + ': ' + truncate(er.msg, 160);
+    }).join('\n');
+    diagCard.appendChild(errList);
+  }
+  sc.appendChild(diagCard);
+  sc.appendChild(h('.pdt-row', { style: { flexWrap: 'wrap', marginTop: '8px' } }, [
+    h('button.pdt-btn', { type: 'button', onclick: function () {
+      copyText(JSON.stringify(collectDiagnostics(), null, 2));
+    } }, [iconEl('copy', 14), 'Copy report']),
+    h('button.pdt-btn', { type: 'button', onclick: function () {
+      restartUI();
+    } }, [iconEl('refresh', 14), 'Restart UI']),
+    h('button.pdt-btn.danger', { type: 'button', onclick: function () {
+      confirmModal('Unload Pocket DevTools completely?', 'Unload', function () {
+        destroyTool();
+      }, true);
+    } }, [iconEl('xc', 14), 'Unload'])
+  ]));
+  sc.appendChild(h('.pdt-mtext', { style: { fontSize: '.82em' } },
+    'Restart UI rebuilds the panel without touching hooks or captured data — use it if anything looks wedged. ' +
+    'Unload removes every hook, button and listener, restoring the page to its pre-injection state (tap the bookmarklet to start again).'));
 
   /* --- about --- */
   sc.appendChild(h('.pdt-label', 'About'));

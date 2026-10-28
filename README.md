@@ -94,6 +94,51 @@ getListeners(el)     // captured listeners     monitorEvents(el, [types])
 pdt                  // the public API object
 ```
 
+## What's new in v5.3 — touch & visibility fixes (Android Firefox)
+
+- **Every button is now visible**: icon buttons (pause, blocker, HAR, clear, inspect, close …)
+  are proper chips with a background and border in all three themes; segmented controls, chips
+  and normal buttons got higher-contrast `--btn`/`--btnbd` tokens (AMOLED included)
+- **Close the floating icon**: the FAB has a small red **×** badge — tap it and the icon
+  disappears for the current page load. Refresh or re-tap the bookmarklet to bring it back,
+  or use the permanent switch in Settings → Floating button / `pdt.showFab()`
+- **Flick down to close**: dragging the grabber (or the title row) down now *closes* the panel
+  with a natural flick — dragging up still resizes, and a quick **tap on the grabber toggles
+  maximize/restore**; a cancelled gesture (browser takes over for scrolling) restores the
+  pre-drag height instead of mis-applying the resize
+- **Firefox touch fixes**: inspect-mode no longer relies on `pointerType` (Firefox does not set
+  it on click events, which could eat taps); `touchcancel` is handled during element picking
+- **Snappier taps**: `touch-action: manipulation` on all controls (no 300 ms delay /
+  double-tap-zoom interference), bigger grabber (32 px) and head buttons (38 px)
+- Verified with **154 automated end-to-end checks** (previous 125 + 29 new touch/visibility
+  regression checks in `test/e2e5.html`) and a real-touch gesture suite (flick-close, tap-to
+  maximize, finger-scroll in every panel, badge hide/restore, destroy + re-inject cycle)
+
+## What's new in v5.2 — maximum stability
+
+- **Error boundary everywhere**: every UI handler, console patch, network hook, timer and animation
+  frame runs inside a central `safe()` wrapper that *records* internal failures instead of letting
+  them escape into the page — the tools can no longer be the reason a page breaks
+- **Hostile-object hardening**: `console.log()` with revoked proxies, throwing getters, circular
+  references or 200 KB strings is captured safely (and huge strings are truncated for display)
+- **Recursion-proof error trapping**: the `window.onerror` / `unhandledrejection` handlers are
+  themselves guarded, so a hostile error reason can never start an error → handler → error loop
+- **Incremental network rendering**: new requests prepend rows and pending rows update in place
+  (once per animation frame) instead of re-rendering the whole list — no jank on busy pages
+- **WebSocket buffer cap**: chatty sockets keep only the last ~10 KB of frames in memory
+- **`pdt.restartUI()`** (Settings → *Restart UI*): rebuilds the whole panel without losing hooks
+  or captured data — self-healing for a wedged UI, no page refresh needed
+- **`pdt.destroy()`** (Settings → *Unload*): full teardown — restores the original `console`,
+  `fetch`, `XMLHttpRequest`, `WebSocket`, `sendBeacon`, `addEventListener` and removes every
+  listener, timer and DOM node; the page returns to its exact pre-injection state
+- **Diagnostics & health card** in Settings: live hook status, stylesheet/CSP state, storage
+  writability, captured counts, internal-error log, JS heap (where exposed) + *Copy report*
+- **CSP style-block detection**: pages whose Content-Security-Policy blocks the tools' stylesheet
+  get a minimal inline-style fallback so the panel stays visible and usable
+- Verified with **125 automated end-to-end checks** (46 e2e + 18 e2e2 + 22 e2e3 userscript
+  persistence + 6 user.js artifact + 33 stability suite — hostile objects, XSS escaping, ring
+  buffers, destroy/re-inject full cycle) plus live injection on example.com and news.ycombinator.com
+
 ## What's new in v5.1 — refresh survival
 
 - **Userscript edition** (`pocket-devtools.user.js`): runs at `document-start` on every page via
@@ -128,13 +173,16 @@ pdt                  // the public API object
 - Full-screen multi-line console editor, history navigation, duplicate collapsing
 - **Copy as cURL**, request/response bodies with JSON pretty-print in Network
 - Error trapping for uncaught exceptions and unhandled rejections
-- Bottom-sheet layout with drag-to-resize handle, horizontally scrolling tabs, ≥34px touch targets
+- Bottom-sheet layout with drag-to-resize handle (flick down = close, tap = maximize),
+  horizontally scrolling tabs, ≥38px touch targets, `touch-action: manipulation` everywhere
 - Public API: `window.__POCKET_DEVTOOLS__`
 
 ## API (for console/snippets/plugins)
 
 ```js
 __POCKET_DEVTOOLS__.toggle()           // show/hide panel
+__POCKET_DEVTOOLS__.hideFab()           // hide the floating icon (this page load)
+__POCKET_DEVTOOLS__.showFab()           // restore the floating icon
 __POCKET_DEVTOOLS__.select(el)         // inspect an element programmatically
 __POCKET_DEVTOOLS__.tab('network')     // switch to a tab
 __POCKET_DEVTOOLS__.run('1+1')         // eval in page scope -> {ok, value}
@@ -144,6 +192,10 @@ __POCKET_DEVTOOLS__.listeners(el)      // captured event listeners for el
 __POCKET_DEVTOOLS__.har()              // HAR 1.2 object of captured traffic
 __POCKET_DEVTOOLS__.block('*.ads.*')   // add a network block rule
 __POCKET_DEVTOOLS__.unblockAll()       // remove all block rules
+__POCKET_DEVTOOLS__.diagnostics()      // full self-health report (hooks, storage, errors…)
+__POCKET_DEVTOOLS__.errors()           // internal errors caught by the safe() boundary
+__POCKET_DEVTOOLS__.restartUI()        // rebuild the panel, keep hooks + captured data
+__POCKET_DEVTOOLS__.destroy()          // full teardown — restore every patched native
 ```
 
 ## Build from source
@@ -153,14 +205,15 @@ node build.js          # concatenates src/*.js -> src.readable.js + src.js + poc
 node build.js --minify # also minifies (requires terser)
 ```
 
-Local test pages live in `test/` (`index.html` manual, `e2e.html` + `e2e2.html` + `e2e3.html` automated
-suites — 86 automated end-to-end checks covering every panel, plus `e2e3.html` which simulates a
+Local test pages live in `test/` (`index.html` manual, `e2e.html` + `e2e2.html` + `e2e3.html` + `e2e4.html` automated
+suites — 125 automated end-to-end checks covering every panel, plus `e2e3.html` which simulates a
 userscript manager loading the core at document-start in three phases: deferred boot + early capture,
-refresh restore, and site exclusion; `us.html` verifies the shipped userscript artifact itself).
+refresh restore, and site exclusion; `e2e4.html` is the stability suite (hostile objects, XSS escaping,
+ring-buffer caps, restartUI/destroy/re-inject full cycle); `us.html` verifies the shipped userscript artifact itself).
 
 ## Known limitations
 
-- **Bookmarklet edition only:** sites with a strict CSP that blocks `cdn.jsdelivr.net` or inline `<style>` cannot load the tools (same as the original). The userscript edition is injected by the manager itself and works on far more pages; if a specific site still blocks it, enable the manager's experimental/instant injection mode.
+- **Bookmarklet edition only:** sites with a strict CSP that blocks `cdn.jsdelivr.net` cannot load the script at all. If the page's CSP blocks inline `<style>`, v5.2 detects it, warns in the console and falls back to minimal inline styles so the panel stays usable. The userscript edition is injected by the manager itself and works on far more pages; if a specific site still blocks it, enable the manager's experimental/instant injection mode.
 - **Bookmarklet edition only:** requests that completed **before** the bookmarklet was activated are not visible — the userscript edition sees everything from `document-start`.
 - `HttpOnly` cookies are invisible to JavaScript (by browser design).
 - Network response headers are limited by CORS on cross-origin requests.

@@ -100,7 +100,7 @@ if (/[?&]p=C/.test(location.search)) {
         rec(list, 'A2 head: no document.body yet', E.hadBody === false, 'body=' + E.hadBody);
         rec(list, 'A3 head: UI deferred (no early boot)', E.booted === false, 'booted=' + E.booted);
         rec(list, 'A4 booted after DOM ready', !!pdt(), 'api=' + !!pdt());
-        rec(list, 'A5 version is 5.1.0', pdt() && pdt().version === '5.1.0', 'v=' + (pdt() && pdt().version));
+        rec(list, 'A5 version is 5.3.0', pdt() && pdt().version === '5.3.0', 'v=' + (pdt() && pdt().version));
         rec(list, 'A6 edition is userscript', pdt() && pdt().edition === 'userscript', 'ed=' + (pdt() && pdt().edition));
         rec(list, 'A7 background mode: sheet NOT auto-opened', pdt() && !sheetOpen(), 'open=' + sheetOpen());
         var fab = null;

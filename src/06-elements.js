@@ -15,6 +15,8 @@ var EVT_CAP = 5000;
   try {
     var AEL = EventTarget.prototype.addEventListener;
     var REL = EventTarget.prototype.removeEventListener;
+    natives.ael = AEL; natives.rel = REL;
+    stab().diag.ael = true;
     EventTarget.prototype.addEventListener = function (type, fn, opts) {
       try {
         if (typeof fn === 'function' && evtListeners.length < EVT_CAP) {
@@ -25,7 +27,7 @@ var EVT_CAP = 5000;
             passive: !!(opts && typeof opts === 'object' && opts.passive)
           });
         }
-      } catch (e) { /* noop */ }
+      } catch (e) { /* hostile target */ }
       return AEL.apply(this, arguments);
     };
     EventTarget.prototype.removeEventListener = function (type, fn, opts) {
@@ -35,7 +37,7 @@ var EVT_CAP = 5000;
           var L = evtListeners[i];
           if (L.el === this && L.type === type && L.fn === fn && L.capture === cap) { evtListeners.splice(i, 1); break; }
         }
-      } catch (e) { /* noop */ }
+      } catch (e) { /* hostile target */ }
       return REL.apply(this, arguments);
     };
   } catch (e) { /* prototype locked */ }
@@ -87,6 +89,21 @@ function xpathFor(el) {
 /* ---------------- inspect mode ---------------- */
 function toggleInspect() { inspectOn ? stopInspect(true) : startInspect(); }
 
+/* stable safe()-wrapped references — add/removeEventListener need the SAME
+ * function object, so the wrappers are created exactly once */
+var inspFns = null;
+function inspHandlers() {
+  if (!inspFns) {
+    inspFns = {
+      touch: safe(inspTouch, 'insp.touch'),
+      end: safe(inspEnd, 'insp.end'),
+      mouse: safe(inspMouse, 'insp.mouse'),
+      click: safe(inspClick, 'insp.click')
+    };
+  }
+  return inspFns;
+}
+
 function startInspect() {
   if (inspectOn) return;
   inspectOn = true;
@@ -97,26 +114,30 @@ function startInspect() {
   ovlLabel.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483647;display:none;' +
     'background:#1e1f24;color:#fff;font:600 11px/1.4 -apple-system,Roboto,sans-serif;padding:3px 8px;' +
     'border-radius:6px;white-space:nowrap;max-width:90vw;overflow:hidden;text-overflow:ellipsis';
-  document.body.appendChild(ovlBox);
-  document.body.appendChild(ovlLabel);
-  document.addEventListener('touchstart', inspTouch, true);
-  document.addEventListener('touchmove', inspTouch, true);
-  document.addEventListener('touchend', inspEnd, true);
-  document.addEventListener('mousemove', inspMouse, true);
-  document.addEventListener('click', inspClick, true);
+  (document.body || document.documentElement).appendChild(ovlBox);
+  (document.body || document.documentElement).appendChild(ovlLabel);
+  var F = inspHandlers();
+  document.addEventListener('touchstart', F.touch, true);
+  document.addEventListener('touchmove', F.touch, true);
+  document.addEventListener('touchend', F.end, true);
+  document.addEventListener('touchcancel', F.end, true);
+  document.addEventListener('mousemove', F.mouse, true);
+  document.addEventListener('click', F.click, true);
   toast('Inspect: touch an element, release to select');
-  var b = root.querySelector('.pdt-ib[title="Inspect element"]');
+  var b = root ? root.querySelector('.pdt-ib[title="Inspect element"]') : null;
   if (b) b.style.color = 'var(--accent)';
 }
 
 function stopInspect(cancel) {
   if (!inspectOn) return;
   inspectOn = false;
-  document.removeEventListener('touchstart', inspTouch, true);
-  document.removeEventListener('touchmove', inspTouch, true);
-  document.removeEventListener('touchend', inspEnd, true);
-  document.removeEventListener('mousemove', inspMouse, true);
-  document.removeEventListener('click', inspClick, true);
+  var F = inspHandlers();
+  document.removeEventListener('touchstart', F.touch, true);
+  document.removeEventListener('touchmove', F.touch, true);
+  document.removeEventListener('touchend', F.end, true);
+  document.removeEventListener('touchcancel', F.end, true);
+  document.removeEventListener('mousemove', F.mouse, true);
+  document.removeEventListener('click', F.click, true);
   if (ovlBox) { ovlBox.remove(); ovlBox = null; }
   if (ovlLabel) { ovlLabel.remove(); ovlLabel = null; }
   var b = root ? root.querySelector('.pdt-ib[title="Inspect element"]') : null;
@@ -150,8 +171,11 @@ function drawHighlight(el) {
   ovlLabel.style.top = (r.top > 30 ? (r.top - 26) : (r.bottom + 6)) + 'px';
 }
 
-var inspLast = null, inspStart = null;
+var inspLast = null, inspStart = null, inspTouchAt = 0;
 function inspTouch(e) {
+  inspTouchAt = Date.now();          /* Firefox does not set pointerType on the
+                                     * click that follows a tap — remember the
+                                     * touch so inspClick can ignore it */
   var t = e.touches[0];
   if (!t) return;
   if (!inspStart) inspStart = { x: t.clientX, y: t.clientY, t: Date.now() };
@@ -159,6 +183,11 @@ function inspTouch(e) {
   drawHighlight(inspLast);
 }
 function inspEnd(e) {
+  inspTouchAt = Date.now();
+  if (e && e.type === 'touchcancel') { /* gesture aborted (browser took over,
+    scroll happened) — cancel quietly, never select on cancel */
+    inspStart = null; inspLast = null; return;
+  }
   var st = inspStart; inspStart = null;
   var el = inspLast; inspLast = null;
   if (!el) return;
@@ -179,7 +208,9 @@ function inspMouse(e) {
   drawHighlight(inspLast);
 }
 function inspClick(e) {
-  if (e.pointerType === 'touch') return;
+  /* Chrome marks touch-driven clicks with pointerType; Firefox leaves it
+   * undefined, so also skip clicks that immediately follow a touch. */
+  if (e.pointerType === 'touch' || Date.now() - inspTouchAt < 800) return;
   e.preventDefault(); e.stopPropagation();
   if (inspLast) { selectElement(inspLast); stopInspect(false); }
 }

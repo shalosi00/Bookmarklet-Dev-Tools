@@ -1,4 +1,4 @@
-/*! Pocket DevTools v5.1.0 | MIT | improved fork of DeveloperExotic/Bookmarklet-Dev-Tools */
+/*! Pocket DevTools v5.3.0 | MIT | improved fork of DeveloperExotic/Bookmarklet-Dev-Tools */
 /* ===== 01-header.js ===== */
 /*
  * Pocket DevTools v5.0 — mobile-first developer tools as a bookmarklet.
@@ -17,7 +17,7 @@
     return;
   }
 
-  var VERSION = '5.1.0';
+  var VERSION = '5.3.0';
 
   /* Build flavour. The userscript edition (pocket-devtools.user.js) sets this
    * flag right before the core runs: capture starts at document-start and the
@@ -51,6 +51,7 @@
     return s;
   }
   var settings = loadSettings();
+  stab().diag.bootTime = Date.now();
 
   /* Userscript site exclusion — decided before any hook or UI is installed,
    * so excluded sites stay 100% untouched. */
@@ -72,7 +73,7 @@
   }
   /* The debounced write must survive a refresh/navigation — flush it on
    * pagehide so settings (last tab, toggles…) are never lost mid-debounce. */
-  window.addEventListener('pagehide', function () {
+  onEvt(window, 'pagehide', function () {
     clearTimeout(saveTimer);
     try { localStorage.setItem('pdt:settings', JSON.stringify(settings)); } catch (e) { /* noop */ }
   });
@@ -113,6 +114,7 @@
     selHistory: [],                 /* $0 .. $4 — last 5 selected elements */
     lastResult: undefined,          /* $_ — result of last console command */
     activeTab: (settings.lastTab && /^[a-z]+$/.test(settings.lastTab)) ? settings.lastTab : 'console',
+    fabHidden: false,               /* FAB hidden via its × badge (this load only) */
     netEntries: [], netSeq: 0, netPaused: false,
     conEntries: [], conRendered: 0,
     conFilters: { log: true, info: true, warn: true, error: true, debug: true },
@@ -129,6 +131,259 @@
   };
 
   function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+
+
+/* ===== 01b-stability.js ===== */
+/*
+ * 01b-stability.js — the "maximum stability" layer.
+ *
+ * Everything the tool runs — UI handlers, console/network hooks, timers,
+ * animation frames — is wrapped in a central error boundary (safe()) that
+ * RECORDS the failure instead of letting it escape into the page. A devtool
+ * must never be the reason a page breaks.
+ *
+ * Also provides:
+ *   - tracked listeners (onEvt) and timers, so destroyTool() can undo all
+ *     of them and restore every patched native (console, fetch, XHR, WS, ...)
+ *   - restartUI(): rebuild the whole sheet without losing capture or a page
+ *     refresh (recover from a wedged UI)
+ *   - CSP detection + critical inline-style fallback for pages whose
+ *     Content-Security-Policy blocks our <style> element
+ *   - collectDiagnostics(): self-health report surfaced in Settings
+ */
+
+/* Lazily-initialized state: 01-header.js executes before this file is
+ * concatenated-in, but function declarations hoist to the top of the IIFE —
+ * so stab() is callable from anywhere at any time. */
+var _stab = null;
+var natives = { conDesc: {} };   /* original refs saved by the hook modules */
+
+function stab() {
+  if (!_stab) _stab = {
+    errors: [],          /* last 50 internal errors {t, where, msg} */
+    errToastAt: 0,       /* throttle for the "internal error" toast */
+    listeners: [],       /* every listener we attached via onEvt */
+    timers: [],          /* every interval/timeout we track */
+    diag: {
+      bootTime: Date.now(),
+      console: null,     /* console patched?       true/false */
+      fetch: null,       /* fetch hooked?          */
+      xhr: null,         /* XHR hooked?            */
+      ws: null,          /* WebSocket hooked?      */
+      beacon: null,      /* sendBeacon hooked?     */
+      ael: null,         /* listener capture on?   */
+      styleApplied: null /* our <style> honoured?  true/false/null=unknown */
+    }
+  };
+  return _stab;
+}
+
+/* ---------------- error boundary ---------------- */
+function pdError(err, where) {
+  var S = stab();
+  var msg = '(unavailable)';
+  try { msg = String(err && (err.stack || err.message) || err); } catch (e) { /* noop */ }
+  try {
+    S.errors.push({ t: Date.now(), where: where || '?', msg: truncate(msg, 500) });
+    if (S.errors.length > 50) S.errors.shift();
+  } catch (e) { /* even the recorder must never throw */ }
+  /* surface briefly — throttled so a storm of errors cannot spam toasts */
+  try {
+    var now = Date.now();
+    if (app && now - S.errToastAt > 10000) {
+      S.errToastAt = now;
+      toast('Internal error caught (' + (where || '?') + ') — see Settings \u2192 Diagnostics');
+    }
+  } catch (e) { /* noop */ }
+}
+
+/* safe(fn) -> wrapped fn: same this/arguments, exceptions recorded, never thrown */
+function safe(fn, where) {
+  return function () {
+    try { return fn.apply(this, arguments); }
+    catch (e) { pdError(e, where || (fn && fn.name) || 'anon'); return undefined; }
+  };
+}
+
+/* ---------------- tracked listeners & timers ---------------- */
+function onEvt(target, type, fn, opts) {
+  var wrapped = safe(fn, 'evt:' + type);
+  try { target.addEventListener(type, wrapped, opts || false); }
+  catch (e) { return null; }
+  try { stab().listeners.push({ t: target, type: type, fn: wrapped, opts: opts || false }); } catch (e) { /* noop */ }
+  return wrapped;
+}
+function pdEvery(fn, ms, where) {
+  var id = setInterval(safe(fn, where || 'interval'), ms);
+  stab().timers.push({ id: id, kind: 'i' });
+  return id;
+}
+function pdAfter(fn, ms, where) {
+  var id = setTimeout(safe(fn, where || 'timeout'), ms);
+  stab().timers.push({ id: id, kind: 't' });
+  return id;
+}
+
+/* ---------------- CSP: did our stylesheet actually apply? ---------------- */
+function checkStyleApplied() {
+  try {
+    if (!app) return;
+    /* .pdt-root must be position:absolute per 03-css.js; a blocked <style>
+     * leaves it static */
+    var pos = getComputedStyle(app).position;
+    stab().diag.styleApplied = (pos === 'absolute');
+    if (!stab().diag.styleApplied) {
+      applyCriticalFallback();
+      conEmit('warn', ['Pocket DevTools: this page\u2019s Content-Security-Policy blocks the tools\u2019 stylesheet — using minimal fallback styles.']);
+    }
+  } catch (e) { stab().diag.styleApplied = null; }
+}
+
+/* Minimal inline styles so the sheet stays visible & usable without CSS.
+ * Inline style attributes survive style-src rules that block <style> blocks. */
+function applyCriticalFallback() {
+  try {
+    app.style.cssText += ';position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;' +
+      'z-index:2147483647;font-family:-apple-system,Roboto,sans-serif;font-size:13px;color:#e8eaed;';
+    sheetEl.style.cssText += ';position:absolute;left:0;right:0;bottom:0;height:55%;min-height:180px;' +
+      'display:flex;flex-direction:column;pointer-events:auto;background:#1e1f24;color:#e8eaed;' +
+      'border-top:1px solid #3a3d45;box-shadow:0 -10px 40px rgba(0,0,0,.5);';
+    fabEl.style.cssText += ';position:absolute;width:52px;height:52px;border-radius:50%;background:#5b9dff;' +
+      'border:0;color:#fff;display:flex;align-items:center;justify-content:center;' +
+      'pointer-events:auto;box-shadow:0 6px 22px rgba(0,0,0,.5);right:14px;bottom:18px;';
+  } catch (e) { /* noop */ }
+}
+
+/* ---------------- storage probes (for diagnostics) ---------------- */
+function lsOk() {
+  try { localStorage.setItem('pdt:probe', '1'); localStorage.removeItem('pdt:probe'); return true; }
+  catch (e) { return false; }
+}
+function ssOk() {
+  try { sessionStorage.setItem('pdt:probe', '1'); sessionStorage.removeItem('pdt:probe'); return true; }
+  catch (e) { return false; }
+}
+
+/* ---------------- diagnostics report ---------------- */
+function collectDiagnostics() {
+  var S = stab(), d = S.diag;
+  function yn(v) { return v === true ? 'active' : v === false ? 'off' : 'unknown'; }
+  var mem = null;
+  try {
+    mem = (performance.memory && performance.memory.usedJSHeapSize)
+      ? fmtBytes(performance.memory.usedJSHeapSize) : null;
+  } catch (e) { mem = null; }
+  return {
+    version: 'v' + VERSION,
+    edition: IS_USERSCRIPT ? 'userscript' : 'bookmarklet',
+    url: String(location.href),
+    userAgent: navigator.userAgent,
+    uptime: Math.round((Date.now() - d.bootTime) / 1000) + ' s',
+    hooks: {
+      console: yn(d.console), fetch: yn(d.fetch), xhr: yn(d.xhr),
+      websocket: yn(d.ws), sendBeacon: yn(d.beacon), listenerCapture: yn(d.ael)
+    },
+    stylesheet: d.styleApplied === true ? 'applied'
+      : d.styleApplied === false ? 'BLOCKED by page CSP — fallback in use' : 'unknown',
+    storage: {
+      localStorage: lsOk() ? 'writable' : 'blocked',
+      sessionStorage: ssOk() ? 'writable' : 'blocked',
+      cookies: (navigator.cookieEnabled ? 'enabled' : 'blocked')
+    },
+    captured: {
+      consoleEntries: ctx.conEntries.length,
+      networkEntries: ctx.netEntries.length,
+      domListeners: (typeof evtListeners !== 'undefined' && evtListeners) ? evtListeners.length : 0
+    },
+    internalErrors: { count: S.errors.length, last: S.errors.slice(-5) },
+    jsHeap: mem || 'not exposed (Firefox)'
+  };
+}
+
+/* ---------------- full teardown ----------------
+ * Removes every hook, listener, timer and DOM node the tool created and
+ * restores the page to its pre-injection state. Re-tapping the bookmarklet
+ * afterwards boots a fresh copy. */
+function destroyTool(silent) {
+  var S = stab();
+  try { stopInspect(true); } catch (e) { /* noop */ }
+  try { stopFps(); } catch (e) { /* noop */ }
+
+  /* tracked listeners */
+  S.listeners.forEach(function (L) {
+    try { L.t.removeEventListener(L.type, L.fn, L.opts); } catch (e) { /* noop */ }
+  });
+  S.listeners = [];
+
+  /* tracked timers + the settings debounce */
+  S.timers.forEach(function (tm) {
+    try { if (tm.kind === 'i') clearInterval(tm.id); else clearTimeout(tm.id); } catch (e) { /* noop */ }
+  });
+  S.timers = [];
+  try { clearTimeout(saveTimer); } catch (e) { /* noop */ }
+
+  /* console restore: put back the exact descriptors we found at load time */
+  for (var m in natives.conDesc) {
+    try {
+      if (natives.conDesc[m]) Object.defineProperty(console, m, natives.conDesc[m]);
+      else delete console[m];
+    } catch (e) { try { delete console[m]; } catch (e2) { /* noop */ } }
+  }
+  stab().diag.console = false;
+
+  /* network + listener-capture restore */
+  try { if (natives.fetch) window.fetch = natives.fetch; } catch (e) { /* noop */ }
+  try {
+    if (natives.xhrOpen) {
+      XMLHttpRequest.prototype.open = natives.xhrOpen;
+      XMLHttpRequest.prototype.send = natives.xhrSend;
+      XMLHttpRequest.prototype.setRequestHeader = natives.xhrSetHeader;
+    }
+  } catch (e) { /* noop */ }
+  try { if (natives.beacon) navigator.sendBeacon = natives.beacon; } catch (e) { /* noop */ }
+  try { if (natives.ws) window.WebSocket = natives.ws; } catch (e) { /* noop */ }
+  try {
+    if (natives.ael) {
+      EventTarget.prototype.addEventListener = natives.ael;
+      EventTarget.prototype.removeEventListener = natives.rel;
+    }
+  } catch (e) { /* noop */ }
+  stab().diag.fetch = stab().diag.xhr = stab().diag.ws = stab().diag.beacon = stab().diag.ael = false;
+  try { if (typeof evtListeners !== 'undefined') evtListeners = []; } catch (e) { /* noop */ }
+
+  /* console helper globals */
+  ['$', '$$', '$x', '$_', '$0', '$1', '$2', '$3', '$4', 'copy', 'clear', 'inspect',
+   'keys', 'values', 'getListeners', 'monitorEvents', 'pdt'].forEach(function (name) {
+    try { delete window[name]; } catch (e) { /* noop */ }
+  });
+
+  /* UI + shared panel refs */
+  try { if (hostEl && hostEl.parentNode) hostEl.parentNode.removeChild(hostEl); } catch (e) { /* noop */ }
+  try { resetPanelRefs(); } catch (e) { /* noop */ }
+  try { ssSet('open', null); } catch (e) { /* noop */ }
+
+  try { delete window.__POCKET_DEVTOOLS__; } catch (e) { try { window.__POCKET_DEVTOOLS__ = undefined; } catch (e2) { /* noop */ } }
+
+  if (!silent) {
+    try { nativeCon.info('Pocket DevTools unloaded — hooks restored, UI removed. Tap the bookmarklet to start it again.'); }
+    catch (e) { /* noop */ }
+  }
+}
+
+/* ---------------- UI restart (self-healing) ----------------
+ * Tears down and rebuilds the whole sheet in place — capture, hooks and
+ * settings are untouched, so nothing that already happened is lost. Use it
+ * when a panel wedges or after importing settings. */
+function restartUI() {
+  var wasOpen = sheetEl ? sheetEl.classList.contains('open') : true;
+  try { if (hostEl && hostEl.parentNode) hostEl.parentNode.removeChild(hostEl); } catch (e) { /* noop */ }
+  try { resetPanelRefs(); } catch (e) { /* noop */ }
+  ctx.fabHidden = false;   /* a UI repair must never leave the user without
+                            * an entry point — always bring the icon back */
+  buildShell();
+  if (!wasOpen) { try { closeSheet(); } catch (e) { /* noop */ } }
+  toast('Pocket DevTools UI restarted');
+}
 
 
 /* ===== 02-utils.js ===== */
@@ -155,11 +410,11 @@ function h(sel, attrs, kids) {
     for (var k in attrs) {
       var v = attrs[k];
       if (v == null) continue;
-      if (k === 'style' && typeof v === 'object') { for (var sk in v) el.style[sk] = v[sk]; }
-      else if (k.slice(0, 2) === 'on' && typeof v === 'function') el.addEventListener(k.slice(2), v);
-      else if (k === 'dataset') { for (var dk in v) el.dataset[dk] = v[dk]; }
+      if (k === 'style' && typeof v === 'object') { for (var sk in v) { try { el.style[sk] = v[sk]; } catch (e) { /* noop */ } } }
+      else if (k.slice(0, 2) === 'on' && typeof v === 'function') el.addEventListener(k.slice(2), safe(v, 'ui.' + k));
+      else if (k === 'dataset') { for (var dk in v) { try { el.dataset[dk] = v[dk]; } catch (e) { /* noop */ } } }
       else if (k === 'value' || k === 'checked' || k === 'disabled' || k === 'selectedIndex') { try { el[k] = v; } catch (e) { /* noop */ } }
-      else el.setAttribute(k, v);
+      else { try { el.setAttribute(k, v); } catch (e) { /* noop */ } }
     }
   }
   addKids(el, kids);
@@ -279,7 +534,7 @@ function debounce(fn, ms) {
   return function () {
     var a = arguments, self = this;
     clearTimeout(t);
-    t = setTimeout(function () { fn.apply(self, a); }, ms || 150);
+    t = setTimeout(function () { try { fn.apply(self, a); } catch (e) { pdError(e, 'debounce'); } }, ms || 150);
   };
 }
 
@@ -298,7 +553,7 @@ function copyText(text, silent) {
     ta.value = text;
     ta.setAttribute('readonly', '');
     ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
-    document.body.appendChild(ta);
+    (document.body || document.documentElement).appendChild(ta);
     ta.select();
     var ok = false;
     try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
@@ -373,7 +628,7 @@ function serialize(v, depth) {
     if (v === null) return 'null';
     if (v === undefined) return 'undefined';
     var t = typeof v;
-    if (t === 'string') return v;
+    if (t === 'string') return v.length > 10000 ? v.slice(0, 10000) + '… [truncated]' : v;
     if (t === 'number' || t === 'boolean' || t === 'bigint') return String(v);
     if (t === 'function') return 'ƒ ' + (v.name || 'anonymous') + '()';
     if (t === 'symbol') return v.toString();
@@ -416,9 +671,9 @@ function downloadFile(name, content, mime) {
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
     a.href = url; a.download = name;
-    document.body.appendChild(a);
+    (document.body || document.documentElement).appendChild(a);
     a.click();
-    setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 400);
+    setTimeout(function () { try { URL.revokeObjectURL(url); a.remove(); } catch (e) { /* noop */ } }, 400);
     toast('Downloading ' + name);
   } catch (e) { toast('Download failed'); }
 }
@@ -466,12 +721,12 @@ function installConsoleHelpers() {
     if (!el || !el.addEventListener) { toast('monitorEvents(element, [types])'); return; }
     types = types || ['click', 'input', 'change', 'keydown', 'scroll', 'touchstart'];
     types.forEach(function (t) {
-      el.addEventListener(t, function (e) {
+      el.addEventListener(t, safe(function (e) {
         conEmit('info', ['[event] ' + (el.tagName || 'obj') + ' ' + t + ' ' + serialize({
           type: e.type, target: (e.target && e.target.tagName) || '?',
           key: e.key, x: e.clientX, y: e.clientY, value: (e.target && e.target.value || '').slice ? String(e.target.value).slice(0, 80) : undefined
         }, 1)]);
-      }, { passive: true });
+      }, 'monitorEvents'), { passive: true });
     });
     return 'Monitoring ' + types.join(', ') + ' — events print to the console';
   });
@@ -479,35 +734,42 @@ function installConsoleHelpers() {
 }
 
 /* ---------------- lightweight JSON-path pretty print for the object inspector ---------------- */
+/* ---------------- hostile-object-safe kind detection ----------------
+ * Objects logged to the console can be Proxies with throwing traps or
+ * revoked proxies — every access must be guarded so inspecting them can
+ * never throw into the page. */
 function objKind(v) {
   if (v === null) return 'null';
-  if (Array.isArray(v)) return 'array';
   var t = typeof v;
-  if (t === 'object') {
-    if (typeof Element !== 'undefined' && v instanceof Element) return 'element';
-    if (typeof Window !== 'undefined' && v === window) return 'window';
-    if (v instanceof Date) return 'date';
-    if (v instanceof Error) return 'error';
-    if (v instanceof RegExp) return 'regexp';
-    if (typeof Map !== 'undefined' && v instanceof Map) return 'map';
-    if (typeof Set !== 'undefined' && v instanceof Set) return 'set';
-    return 'object';
-  }
-  return t;
+  if (t !== 'object') return t;             /* covers function/symbol/… */
+  try { if (Array.isArray(v)) return 'array'; } catch (e) { return 'opaque'; }
+  function isA(C) { try { return v instanceof C; } catch (e) { return false; } }
+  if (typeof Element !== 'undefined' && isA(Element)) return 'element';
+  if (typeof Window !== 'undefined' && v === window) return 'window';
+  if (isA(Date)) return 'date';
+  if (isA(Error)) return 'error';
+  if (isA(RegExp)) return 'regexp';
+  if (typeof Map !== 'undefined' && isA(Map)) return 'map';
+  if (typeof Set !== 'undefined' && isA(Set)) return 'set';
+  return 'object';
 }
 function objPreview(v) {
-  var k = objKind(v);
-  if (k === 'array') return 'Array(' + v.length + ')';
-  if (k === 'object') {
-    try { return '{' + Object.keys(v).length + ' keys}'; } catch (e) { return '{…}'; }
-  }
-  if (k === 'map') return 'Map(' + v.size + ')';
-  if (k === 'set') return 'Set(' + v.size + ')';
-  return serialize(v, 0);
+  try {
+    var k = objKind(v);
+    if (k === 'array') return 'Array(' + v.length + ')';
+    if (k === 'object') {
+      try { return '{' + Object.keys(v).length + ' keys}'; } catch (e) { return '{…}'; }
+    }
+    if (k === 'map') return 'Map(' + v.size + ')';
+    if (k === 'set') return 'Set(' + v.size + ')';
+    return serialize(v, 0);
+  } catch (e) { return '{…}'; }
 }
 function isExpandable(v) {
-  var k = objKind(v);
-  return k === 'array' || k === 'object' || k === 'map' || k === 'set';
+  try {
+    var k = objKind(v);
+    return k === 'array' || k === 'object' || k === 'map' || k === 'set';
+  } catch (e) { return false; }
 }
 
 /* ---------------- color parsing / contrast (Utils > Color tool) ---------------- */
@@ -607,12 +869,12 @@ var CSS = [
 'font-size:var(--fs,13px);color:var(--fg);-webkit-font-smoothing:antialiased}',
 '.pdt-root *,.pdt-root *::before,.pdt-root *::after{box-sizing:border-box;margin:0;padding:0}',
 '.pdt-root{--bg:#1e1f24;--bg2:#26282f;--bg3:#30333b;--fg:#e8eaed;--fg2:#b3b7bf;--muted:#7c818a;',
-'--border:#3a3d45;--accent:#5b9dff;--accent2:#2b4c7e;--ok:#3fb26f;--warn:#e0a63f;--err:#e0564f;',
+'--border:#3a3d45;--btn:#2c2f37;--btnbd:#4a4f5c;--accent:#5b9dff;--accent2:#2b4c7e;--ok:#3fb26f;--warn:#e0a63f;--err:#e0564f;',
 '--mono:ui-monospace,"JetBrains Mono","Cascadia Mono",Menlo,Consolas,monospace}',
 '.pdt-root[data-theme="light"]{--bg:#ffffff;--bg2:#f2f3f5;--bg3:#e7e9ee;--fg:#1c1e22;--fg2:#42474f;',
-'--muted:#8a9099;--border:#d8dbe1;--accent:#2563eb;--accent2:#d6e3fb;--ok:#1f9d55;--warn:#b7791f;--err:#d64545}',
+'--muted:#8a9099;--border:#d8dbe1;--btn:#ffffff;--btnbd:#c3c9d4;--accent:#2563eb;--accent2:#d6e3fb;--ok:#1f9d55;--warn:#b7791f;--err:#d64545}',
 '.pdt-root[data-theme="amoled"]{--bg:#000;--bg2:#0a0a0c;--bg3:#16171b;--fg:#e6e7ea;--fg2:#a9adb4;',
-'--muted:#63666d;--border:#232429;--accent:#6ea8ff;--accent2:#12233f;--ok:#34b56f;--warn:#dfa43c;--err:#e2564f}',
+'--muted:#63666d;--border:#232429;--btn:#15171c;--btnbd:#343947;--accent:#6ea8ff;--accent2:#12233f;--ok:#34b56f;--warn:#dfa43c;--err:#e2564f}',
 '.pdt-root[data-fs="s"]{--fs:12px}.pdt-root[data-fs="l"]{--fs:14.5px}',
 
 '/* ---------- bottom sheet ---------- */',
@@ -622,21 +884,25 @@ var CSS = [
 'box-shadow:0 -10px 40px rgba(0,0,0,.5);transform:translateY(105%);transition:transform .28s cubic-bezier(.32,.72,.35,1)}',
 '.pdt-sheet.open{transform:none}',
 '.pdt-sheet.nodrag{transition:none}',
-'.pdt-handle{flex:none;height:24px;display:flex;align-items:center;justify-content:center;touch-action:none;cursor:ns-resize}',
-'.pdt-handle i{width:46px;height:5px;border-radius:3px;background:var(--muted);opacity:.55}',
+'.pdt-handle{flex:none;height:32px;display:flex;align-items:center;justify-content:center;touch-action:none;cursor:ns-resize}',
+'.pdt-handle i{width:56px;height:5px;border-radius:3px;background:var(--muted);opacity:.6}',
 '.pdt-head{flex:none;display:flex;align-items:center;gap:4px;padding:0 8px 6px}',
-'.pdt-title{font-weight:700;font-size:1em;color:var(--fg);margin-right:auto;display:flex;align-items:center;gap:6px}',
+'.pdt-title{font-weight:700;font-size:1em;color:var(--fg);margin-right:auto;display:flex;align-items:center;gap:6px;',
+'touch-action:none;cursor:ns-resize}',
 '.pdt-title .pdt-ic{color:var(--accent);display:flex}',
 '.pdt-ver{font-size:.8em;color:var(--muted);font-weight:400}',
-'.pdt-ib{min-width:34px;height:34px;border:0;border-radius:9px;background:transparent;color:var(--fg2);',
-'display:inline-flex;align-items:center;justify-content:center;cursor:pointer;font:inherit}',
-'.pdt-ib:active{background:var(--bg3)}',
+'.pdt-ib{min-width:38px;height:38px;border:1px solid var(--btnbd);border-radius:10px;background:var(--btn);color:var(--fg2);',
+'display:inline-flex;align-items:center;justify-content:center;cursor:pointer;font:inherit;touch-action:manipulation;',
+'-webkit-tap-highlight-color:transparent;flex:none}',
+'.pdt-ib:active{background:var(--bg3);border-color:var(--accent)}',
 '.pdt-tabs{flex:none;display:flex;gap:2px;overflow-x:auto;padding:0 8px 8px;border-bottom:1px solid var(--border);',
 'scrollbar-width:none;-ms-overflow-style:none}',
 '.pdt-tabs::-webkit-scrollbar{display:none}',
-'.pdt-tab{flex:none;display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border:0;border-radius:9px;',
-'background:transparent;color:var(--fg2);font:inherit;font-size:.9em;white-space:nowrap;cursor:pointer}',
-'.pdt-tab .pdt-ic{display:flex;opacity:.85}',
+'.pdt-tab{flex:none;display:inline-flex;align-items:center;gap:6px;padding:9px 13px;border:0;border-radius:9px;',
+'background:transparent;color:var(--fg2);font:inherit;font-size:.9em;white-space:nowrap;cursor:pointer;touch-action:manipulation;',
+'-webkit-tap-highlight-color:transparent}',
+'.pdt-tab .pdt-ic{display:flex;opacity:.9}',
+'.pdt-tab:active{background:var(--bg3)}',
 '.pdt-tab.on{background:var(--bg3);color:var(--accent);font-weight:600}',
 '.pdt-body{flex:1;position:relative;overflow:hidden}',
 '.pdt-panel{position:absolute;inset:0;display:none;flex-direction:column;overflow:hidden}',
@@ -647,15 +913,17 @@ var CSS = [
 '.pdt-toolbar{flex:none;display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid var(--border);',
 'overflow-x:auto;scrollbar-width:none}',
 '.pdt-toolbar::-webkit-scrollbar{display:none}',
-'.pdt-btn{flex:none;display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border-radius:9px;border:1px solid var(--border);',
-'background:var(--bg2);color:var(--fg);font:inherit;font-size:.9em;cursor:pointer;white-space:nowrap}',
-'.pdt-btn:active{background:var(--bg3)}',
+'.pdt-btn{flex:none;display:inline-flex;align-items:center;gap:6px;padding:8px 13px;border-radius:9px;border:1px solid var(--btnbd);',
+'background:var(--btn);color:var(--fg);font:inherit;font-size:.9em;cursor:pointer;white-space:nowrap;touch-action:manipulation;',
+'-webkit-tap-highlight-color:transparent}',
+'.pdt-btn:active{background:var(--bg3);border-color:var(--accent)}',
 '.pdt-btn.acc{background:var(--accent);border-color:transparent;color:#fff}',
 '.pdt-btn.danger{background:var(--err);border-color:transparent;color:#fff}',
 '.pdt-btn.ghost{background:transparent}',
 '.pdt-btn.on{background:var(--accent2);border-color:var(--accent);color:var(--accent)}',
-'.pdt-chip{flex:none;padding:5px 11px;border-radius:99px;border:1px solid var(--border);background:var(--bg2);',
-'color:var(--fg2);font:inherit;font-size:.84em;cursor:pointer;white-space:nowrap}',
+'.pdt-chip{flex:none;padding:6px 12px;border-radius:99px;border:1px solid var(--btnbd);background:var(--btn);',
+'color:var(--fg);font:inherit;font-size:.84em;cursor:pointer;white-space:nowrap;touch-action:manipulation;',
+'-webkit-tap-highlight-color:transparent}',
 '.pdt-chip.on{background:var(--accent2);border-color:var(--accent);color:var(--accent);font-weight:600}',
 '.pdt-input,.pdt-select,.pdt-area{width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:9px;',
 'color:var(--fg);font:inherit;font-size:.95em;padding:8px 10px;min-width:0}',
@@ -688,8 +956,8 @@ var CSS = [
 '.s2{color:var(--ok)}.s3{color:var(--accent)}.s4{color:var(--warn)}.s5,.s0{color:var(--err)}.sp{color:var(--muted)}',
 '.pdt-sub{flex:none;display:flex;gap:2px;padding:8px 10px 0;overflow-x:auto;scrollbar-width:none}',
 '.pdt-sub::-webkit-scrollbar{display:none}',
-'.pdt-subb{flex:none;padding:6px 12px;border:0;border-bottom:2px solid transparent;background:none;color:var(--fg2);',
-'font:inherit;font-size:.9em;cursor:pointer;white-space:nowrap}',
+'.pdt-subb{flex:none;padding:7px 12px;border:0;border-bottom:2px solid transparent;background:none;color:var(--fg2);',
+'font:inherit;font-size:.9em;cursor:pointer;white-space:nowrap;touch-action:manipulation;-webkit-tap-highlight-color:transparent}',
 '.pdt-subb.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}',
 
 '/* ---------- console ---------- */',
@@ -724,7 +992,7 @@ var CSS = [
 '.pdt-crumb{flex:none;display:flex;align-items:center;gap:2px;padding:6px 10px;overflow-x:auto;',
 'border-bottom:1px solid var(--border);font-family:var(--mono);font-size:.85em;scrollbar-width:none}',
 '.pdt-crumb::-webkit-scrollbar{display:none}',
-'.pdt-crumb button{border:0;background:none;color:var(--accent);font:inherit;cursor:pointer;padding:3px 5px;border-radius:5px;white-space:nowrap}',
+'.pdt-crumb button{border:0;background:none;color:var(--accent);font:inherit;cursor:pointer;padding:4px 6px;border-radius:5px;white-space:nowrap;touch-action:manipulation}',
 '.pdt-crumb button:active{background:var(--bg3)}',
 '.pdt-crumb i{color:var(--muted);font-style:normal}',
 '.pdt-crumb button.cur{color:var(--fg);font-weight:700}',
@@ -770,11 +1038,15 @@ var CSS = [
 '.pdt-swatch i{width:15px;height:15px;border-radius:4px;border:1px solid rgba(128,128,128,.4)}',
 
 '/* ---------- FAB, toast, modal ---------- */',
-'.pdt-fab{position:absolute;width:48px;height:48px;border-radius:50%;background:var(--bg2);',
-'border:1px solid var(--border);color:var(--accent);display:flex;align-items:center;justify-content:center;',
-'pointer-events:auto;cursor:pointer;box-shadow:0 4px 18px rgba(0,0,0,.45);touch-action:none;user-select:none;',
+'.pdt-fab{position:absolute;width:52px;height:52px;border-radius:50%;background:var(--accent);',
+'border:0;color:#fff;display:flex;align-items:center;justify-content:center;',
+'pointer-events:auto;cursor:pointer;box-shadow:0 6px 22px rgba(0,0,0,.5);touch-action:none;user-select:none;',
 '-webkit-user-select:none;-webkit-tap-highlight-color:transparent}',
 '.pdt-fab:active{transform:scale(.94)}',
+'.pdt-fab .pdt-fabx{position:absolute;top:-5px;right:-5px;width:22px;height:22px;border-radius:50%;background:var(--err);',
+'color:#fff;border:2px solid var(--bg);display:flex;align-items:center;justify-content:center;padding:0;cursor:pointer;',
+'box-shadow:0 2px 8px rgba(0,0,0,.45);touch-action:manipulation;-webkit-tap-highlight-color:transparent}',
+'.pdt-fab .pdt-fabx:active{transform:scale(.9)}',
 '.pdt-root.sheet-open .pdt-fab{display:none}',
 '.pdt-toast{position:absolute;top:16px;left:50%;transform:translateX(-50%) translateY(-12px);background:var(--bg3);',
 'color:var(--fg);padding:9px 16px;border-radius:99px;font-size:.9em;opacity:0;pointer-events:none;',
@@ -799,9 +1071,9 @@ var CSS = [
 '.pdt-themecard .pv{height:52px;display:flex;flex-direction:column;gap:4px;padding:8px}',
 '.pdt-themecard .pv i{border-radius:3px}',
 '.pdt-themecard .nm{font-size:.78em;text-align:center;padding:5px 2px;color:var(--fg2)}',
-'.pdt-seg{display:flex;border:1px solid var(--border);border-radius:9px;overflow:hidden}',
-'.pdt-seg button{flex:1;border:0;background:var(--bg2);color:var(--fg2);font:inherit;font-size:.88em;',
-'padding:8px 4px;cursor:pointer}',
+'.pdt-seg{display:flex;border:1px solid var(--btnbd);border-radius:9px;overflow:hidden;background:var(--btn)}',
+'.pdt-seg button{flex:1;border:0;background:transparent;color:var(--fg2);font:inherit;font-size:.88em;',
+'padding:9px 4px;cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent}',
 '.pdt-seg button.on{background:var(--accent2);color:var(--accent);font-weight:700}',
 'input[type=range]{width:100%;accent-color:var(--accent)}',
 '.pdt-ic{display:inline-flex;line-height:0}'
@@ -820,6 +1092,7 @@ var panelEls = {};
 function registerPanel(def) { panelDefs.push(def); }
 
 var mq = (typeof matchMedia === 'function') ? matchMedia('(prefers-color-scheme: dark)') : null;
+var keysInstalled = false;   /* setupKeys must survive restartUI without stacking listeners */
 
 function resolvedTheme() {
   if (settings.theme === 'auto') return (mq && mq.matches) ? 'dark' : 'light';
@@ -829,7 +1102,7 @@ function applyTheme() {
   if (app) app.dataset.theme = resolvedTheme();
 }
 if (mq && mq.addEventListener) {
-  mq.addEventListener('change', function () { if (settings.theme === 'auto') applyTheme(); });
+  onEvt(mq, 'change', function () { if (settings.theme === 'auto') applyTheme(); });
 }
 
 function buildShell() {
@@ -876,19 +1149,21 @@ function buildShell() {
    *                 open before the refresh (session flag) — otherwise stay in
    *                 the background and offer the FAB. */
   var wantOpen = !IS_USERSCRIPT || settings.usAutoOpenSheet || ssGet('open') === '1';
-  if (wantOpen) requestAnimationFrame(function () { openSheet(); });
+  if (wantOpen) requestAnimationFrame(safe(function () { openSheet(); }, 'boot.open'));
 
   buildTabs();
   switchTab(ctx.activeTab);
   setupResizeDrag();
   setupKeys();
+  /* Did the page's Content-Security-Policy let our <style> through? */
+  requestAnimationFrame(safe(checkStyleApplied, 'styleCheck'));
 }
 
 /* ---------------- tabs ---------------- */
 function buildTabs() {
   panelDefs.forEach(function (p) {
     var b = h('button.pdt-tab', { type: 'button', dataset: { tab: p.id } }, [iconEl(p.icon, 14), p.label]);
-    b.addEventListener('click', function () { switchTab(p.id); });
+    b.addEventListener('click', safe(function () { switchTab(p.id); }, 'tab.' + p.id));
     tabsEl.appendChild(b);
   });
 }
@@ -909,13 +1184,14 @@ function switchTab(id) {
     bodyEl.appendChild(panel);
     panelEls[id] = panel; /* set BEFORE render so panels can self-reference */
     try { def.render(panel); } catch (e) {
+      pdError(e, 'render:' + def.id);
       panel.appendChild(h('.pdt-empty', 'Panel error: ' + (e && e.message)));
       conEmit('error', ['Panel "' + def.id + '" failed to render: ' + (e && (e.message || e))]);
     }
   }
   var cur = root.querySelector('.pdt-tab[data-tab="' + id + '"]');
-  if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' });
-  if (def.onShow) { try { def.onShow(); } catch (e) { /* noop */ } }
+  if (cur && cur.scrollIntoView) { try { cur.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' }); } catch (e) { /* noop */ } }
+  if (def.onShow) { try { def.onShow(); } catch (e) { pdError(e, 'onShow:' + def.id); } }
   /* persist the active tab so the next session re-opens here */
   if (settings.lastTab !== id) { settings.lastTab = id; saveSettings(); }
 }
@@ -940,38 +1216,84 @@ function toggleSheet() {
   sheetEl.classList.contains('open') ? closeSheet() : openSheet();
 }
 
-/* ---------------- resize drag (handle) ---------------- */
+/* ---------------- resize drag (handle + title) ----------------
+ * Mobile bottom-sheet gestures:
+ *   - drag up/down            -> resize panel (22%..92% of viewport)
+ *   - flick down / big drag   -> close the sheet (what a finger expects)
+ *   - tap without moving      -> toggle maximize / restore
+ * The drag zone is the handle strip plus the title row (big touch targets,
+ * buttons excluded). */
 function setupResizeDrag() {
-  var handle = sheetEl.querySelector('.pdt-handle');
-  var dragging = false, startY = 0, startH = 0;
-  handle.addEventListener('pointerdown', function (e) {
-    dragging = true; startY = e.clientY;
-    startH = sheetEl.getBoundingClientRect().height;
-    sheetEl.classList.add('nodrag');
-    try { handle.setPointerCapture(e.pointerId); } catch (err) { /* noop */ }
-    e.preventDefault();
-  });
-  handle.addEventListener('pointermove', function (e) {
-    if (!dragging) return;
-    var dh = startY - e.clientY;
-    var vh = window.innerHeight || 1;
-    var pct = ((startH + dh) / vh) * 100;
-    pct = Math.max(22, Math.min(92, pct));
-    settings.panelHeight = Math.round(pct);
-    sheetEl.style.setProperty('--ph', pct + '%');
-  });
-  function end(e) {
-    if (!dragging) return;
-    dragging = false;
-    sheetEl.classList.remove('nodrag');
-    saveSettings();
+  function attachDrag(zone) {
+    var dragging = false, moved = false, startY = 0, startH = 0, startPct = 0;
+    var lastY = 0, lastT = 0, vel = 0, maxedFrom = null;
+    zone.addEventListener('pointerdown', function (e) {
+      if (e.button != null && e.button > 0) return; /* primary touches/clicks only */
+      dragging = true; moved = false;
+      startY = lastY = e.clientY; lastT = Date.now(); vel = 0;
+      startH = sheetEl.getBoundingClientRect().height;
+      startPct = (startH / (window.innerHeight || 1)) * 100;
+      sheetEl.classList.add('nodrag');
+      try { zone.setPointerCapture(e.pointerId); } catch (err) { /* noop */ }
+      e.preventDefault();
+    });
+    zone.addEventListener('pointermove', function (e) {
+      if (!dragging) return;
+      var dy = e.clientY - startY;
+      if (!moved && Math.abs(dy) < 6) return;
+      moved = true;
+      var now = Date.now(), dt = now - lastT;
+      if (dt > 0 && dt < 200) vel = vel * 0.7 + ((e.clientY - lastY) / dt) * 0.3;
+      lastY = e.clientY; lastT = now;
+      var vh = window.innerHeight || 1;
+      var pct = ((startH - dy) / vh) * 100;
+      pct = Math.max(22, Math.min(92, pct));
+      sheetEl.style.setProperty('--ph', pct + '%');
+    });
+    function end(e) {
+      if (!dragging) return;
+      dragging = false;
+      sheetEl.classList.remove('nodrag');
+      if (e && e.type === 'pointercancel') {
+        /* the browser stole the gesture (scroll/zoom took over) — abort
+         * cleanly: restore the pre-drag height, never close, never save */
+        sheetEl.style.setProperty('--ph', startPct + '%');
+        return;
+      }
+      var totalDy = lastY - startY;
+      if (!moved) {
+        /* tap on the handle/title: toggle maximize */
+        var cur = settings.panelHeight;
+        if (cur < 80) { maxedFrom = cur; settings.panelHeight = 90; }
+        else settings.panelHeight = (maxedFrom != null ? maxedFrom : 55);
+        sheetEl.style.setProperty('--ph', settings.panelHeight + '%');
+        saveSettings();
+        return;
+      }
+      if (vel > 0.55 && totalDy > 30) { restoreThenClose(); return; }   /* flick down */
+      if (totalDy > 130) { restoreThenClose(); return; }                 /* big drag down */
+      var vh = window.innerHeight || 1;
+      settings.panelHeight = Math.round(Math.max(22, Math.min(92,
+        (sheetEl.getBoundingClientRect().height / vh) * 100)));
+      saveSettings();
+    }
+    function restoreThenClose() {
+      /* closing a flick: bring back the pre-drag height so the next open
+       * is the size the user chose before, not the half-dragged one */
+      sheetEl.style.setProperty('--ph', startPct + '%');
+      closeSheet();
+    }
+    zone.addEventListener('pointerup', end);
+    zone.addEventListener('pointercancel', end);
   }
-  handle.addEventListener('pointerup', end);
-  handle.addEventListener('pointercancel', end);
+  attachDrag(sheetEl.querySelector('.pdt-handle'));
+  var title = sheetEl.querySelector('.pdt-title');
+  if (title) attachDrag(title);
 }
 
 /* ---------------- FAB ---------------- */
 function positionFab() {
+  if (!fabEl) return;
   if (settings.fabX != null && settings.fabY != null) {
     fabEl.style.left = settings.fabX + '%';
     fabEl.style.top = settings.fabY + '%';
@@ -980,9 +1302,22 @@ function positionFab() {
     fabEl.style.left = 'auto'; fabEl.style.top = 'auto';
     fabEl.style.right = '14px'; fabEl.style.bottom = '18px';
   }
-  fabEl.style.display = settings.showFAB ? 'flex' : 'none';
+  fabEl.style.display = (settings.showFAB && !ctx.fabHidden) ? 'flex' : 'none';
+}
+function hideFab(userAction) {
+  ctx.fabHidden = true;          /* in-memory only: a refresh or re-tap of the
+                                  * bookmarklet always brings the icon back */
+  positionFab();
+  if (userAction) toast('Icon hidden \u2014 tap the bookmarklet again to bring it back');
+}
+function showFab() {
+  ctx.fabHidden = false;
+  settings.showFAB = true;
+  saveSettings();
+  positionFab();
 }
 function setupFabDrag() {
+  var FAB_SIZE = 52;
   var moved = false, sx = 0, sy = 0;
   fabEl.addEventListener('pointerdown', function (e) {
     moved = false; sx = e.clientX; sy = e.clientY;
@@ -993,17 +1328,17 @@ function setupFabDrag() {
     if (!moved && Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
     moved = true;
     var r = app.getBoundingClientRect();
-    var x = Math.max(0, Math.min(r.width - 48, e.clientX - 24));
-    var y = Math.max(0, Math.min(r.height - 48, e.clientY - 24));
+    var x = Math.max(0, Math.min(r.width - FAB_SIZE, e.clientX - FAB_SIZE / 2));
+    var y = Math.max(0, Math.min(r.height - FAB_SIZE, e.clientY - FAB_SIZE / 2));
     fabEl.style.left = x + 'px'; fabEl.style.top = y + 'px';
     fabEl.style.right = 'auto'; fabEl.style.bottom = 'auto';
   });
   fabEl.addEventListener('pointerup', function (e) {
     if (moved) {
       var r = app.getBoundingClientRect();
-      var wPct = (48 / r.width) * 100, hPct = (48 / r.height) * 100;
-      var xPct = ((parseFloat(fabEl.style.left) + 24) / r.width) * 100;
-      var yPct = ((parseFloat(fabEl.style.top) + 24) / r.height) * 100;
+      var wPct = (FAB_SIZE / r.width) * 100, hPct = (FAB_SIZE / r.height) * 100;
+      var xPct = ((parseFloat(fabEl.style.left) + FAB_SIZE / 2) / r.width) * 100;
+      var yPct = ((parseFloat(fabEl.style.top) + FAB_SIZE / 2) / r.height) * 100;
       /* snap horizontally to the nearest screen edge */
       xPct = xPct < 50 ? 3 : (97 - wPct);
       xPct = Math.max(2, Math.min(96, xPct));
@@ -1015,14 +1350,26 @@ function setupFabDrag() {
       openSheet();
     }
   });
+  /* --- close badge on the FAB: hides the icon until the next load --- */
+  var fabX = h('button.pdt-fabx', { type: 'button', title: 'Hide floating icon', 'aria-label': 'Hide floating icon' });
+  fabX.innerHTML = iconSvg('close', 11);
+  fabX.addEventListener('pointerdown', function (e) { e.stopPropagation(); e.preventDefault(); });
+  fabX.addEventListener('pointerup', function (e) {
+    e.stopPropagation(); e.preventDefault();
+    hideFab(true);
+  });
+  fabX.addEventListener('click', function (e) { e.stopPropagation(); e.preventDefault(); });
+  fabEl.appendChild(fabX);
 }
 
 /* ---------------- keyboard shortcuts (desktop) ---------------- */
 function setupKeys() {
-  document.addEventListener('keydown', function (e) {
+  if (keysInstalled) return;   /* restartUI() rebuilds the shell — never stack handlers */
+  keysInstalled = true;
+  onEvt(document, 'keydown', function (e) {
     if (e.key === 'Escape') {
       if (inspectOn) { stopInspect(true); return; }
-      var mo = root.querySelector('.pdt-mov');
+      var mo = root && root.querySelector('.pdt-mov');
       if (mo) { mo.remove(); return; }
       closeSheet();
     }
@@ -1044,9 +1391,12 @@ function setupKeys() {
  */
 
 var nativeCon = {};
-['log', 'info', 'warn', 'error', 'debug', 'table', 'time', 'timeEnd', 'timeLog',
- 'count', 'countReset', 'group', 'groupCollapsed', 'groupEnd', 'trace', 'dir',
- 'assert', 'clear'].forEach(function (m) {
+var CON_METHODS = ['log', 'info', 'warn', 'error', 'debug', 'table', 'time', 'timeEnd', 'timeLog',
+  'count', 'countReset', 'group', 'groupCollapsed', 'groupEnd', 'trace', 'dir',
+  'assert', 'clear'];
+CON_METHODS.forEach(function (m) {
+  /* save the exact own-property descriptor so destroyTool() can restore it */
+  try { natives.conDesc[m] = Object.getOwnPropertyDescriptor(console, m); } catch (e) { natives.conDesc[m] = null; }
   nativeCon[m] = (typeof console[m] === 'function') ? console[m].bind(console) : function () {};
 });
 
@@ -1063,7 +1413,9 @@ function conEmit(level, args, kind, extra) {
   /* keep raw values for the object inspector (first expandable arg only) */
   if (!entry.vals) {
     for (var j = 0; j < args.length && j < 4; j++) {
-      if (args[j] && isExpandable(args[j])) { entry.val = args[j]; break; }
+      if (args[j] && typeof args[j] === 'object') {
+        try { if (isExpandable(args[j])) { entry.val = args[j]; break; } } catch (e) { /* hostile object */ }
+      }
     }
   }
   var last = ctx.conEntries[ctx.conEntries.length - 1];
@@ -1076,7 +1428,7 @@ function conEmit(level, args, kind, extra) {
       ctx.conEntries.splice(0, ctx.conEntries.length - settings.maxConsole);
     }
   }
-  conRenderNew();
+  try { conRenderNew(); } catch (e) { pdError(e, 'conRender'); }
 }
 
 function conEcho(kind, text) {
@@ -1084,112 +1436,148 @@ function conEcho(kind, text) {
   conRenderNew();
 }
 
-/* patch the whole console API (runs at script load) */
+/* patch the whole console API (runs at script load).
+ * Every patched method: our capture logic runs inside safe() so a hostile
+ * argument (throwing getters, revoked proxies, …) can NEVER make the page's
+ * console call throw — and the native console still receives everything. */
 (function installConsoleCapture() {
   function patch(method, fn) {
     try {
       Object.defineProperty(console, method, {
         value: fn, writable: true, configurable: true
       });
+      stab().diag.console = true;
     } catch (e) { /* some pages lock console */ }
   }
   ['log', 'info', 'warn', 'error', 'debug'].forEach(function (m) {
-    patch(m, function () { conEmit(m, arguments); nativeCon[m].apply(null, arguments); });
+    patch(m, function () {
+      var a = arguments;
+      safe(function () { conEmit(m, a); }, 'console.' + m)();
+      return nativeCon[m].apply(null, a);
+    });
   });
 
   patch('table', function (data, props) {
-    var tbl = buildTableData(data, props);
-    if (tbl) conEmit('log', [tbl.caption || 'console.table'], '', { table: tbl });
-    else conEmit('warn', ['console.table: data must be an array or object']);
+    safe(function () {
+      var tbl = null;
+      try { tbl = buildTableData(data, props); } catch (e) { tbl = null; }
+      if (tbl) conEmit('log', [tbl.caption || 'console.table'], '', { table: tbl });
+      else conEmit('warn', ['console.table: data must be an array or object']);
+    }, 'console.table')();
     try { nativeCon.table(data, props); } catch (e) { /* noop */ }
   });
 
   patch('time', function (label) {
-    label = label || 'default';
-    if (ctx.conTimers[label] != null) conEmit('warn', ['Timer "' + label + '" already exists']);
-    else ctx.conTimers[label] = netNow();
+    safe(function () {
+      var lb = label || 'default';
+      if (ctx.conTimers[lb] != null) conEmit('warn', ['Timer "' + lb + '" already exists']);
+      else ctx.conTimers[lb] = netNow();
+    }, 'console.time')();
     try { nativeCon.time(label); } catch (e) { /* noop */ }
   });
-  function timerEmit(method, label) {
-    label = label || 'default';
-    var t0 = ctx.conTimers[label];
-    if (t0 == null) { conEmit('warn', ['Timer "' + label + '" does not exist']); return null; }
+  function timerEmit(label) {
+    var lb = label || 'default';
+    var t0 = ctx.conTimers[lb];
+    if (t0 == null) { conEmit('warn', ['Timer "' + lb + '" does not exist']); return null; }
     return fmtMs(netNow() - t0);
   }
   patch('timeLog', function (label) {
-    var ms = timerEmit('timeLog', label);
-    if (ms != null) { conEmit('log', [(label || 'default') + ': ' + ms]); try { nativeCon.timeLog(label); } catch (e) { /* noop */ } }
+    safe(function () {
+      var ms = timerEmit(label);
+      if (ms != null) conEmit('log', [(label || 'default') + ': ' + ms]);
+    }, 'console.timeLog')();
+    try { nativeCon.timeLog(label); } catch (e) { /* noop */ }
   });
   patch('timeEnd', function (label) {
-    var ms = timerEmit('timeEnd', label);
-    if (ms != null) {
-      delete ctx.conTimers[label];
-      conEmit('log', [(label || 'default') + ': ' + ms]);
-      try { nativeCon.timeEnd(label); } catch (e) { /* noop */ }
-    }
+    safe(function () {
+      var ms = timerEmit(label);
+      if (ms != null) {
+        delete ctx.conTimers[label || 'default'];
+        conEmit('log', [(label || 'default') + ': ' + ms]);
+      }
+    }, 'console.timeEnd')();
+    try { nativeCon.timeEnd(label); } catch (e) { /* noop */ }
   });
 
   patch('count', function (label) {
-    label = label || 'default';
-    ctx.conCounters[label] = (ctx.conCounters[label] || 0) + 1;
-    conEmit('log', [label + ': ' + ctx.conCounters[label]]);
+    safe(function () {
+      var lb = label || 'default';
+      ctx.conCounters[lb] = (ctx.conCounters[lb] || 0) + 1;
+      conEmit('log', [lb + ': ' + ctx.conCounters[lb]]);
+    }, 'console.count')();
     try { nativeCon.count(label); } catch (e) { /* noop */ }
   });
   patch('countReset', function (label) {
-    label = label || 'default';
-    delete ctx.conCounters[label];
+    safe(function () { delete ctx.conCounters[label || 'default']; }, 'console.countReset')();
     try { nativeCon.countReset(label); } catch (e) { /* noop */ }
   });
 
   function groupPatch(method, collapsed) {
     patch(method, function () {
-      var label = (arguments.length && serialize(arguments[0], 0)) || 'group';
-      conEmit('log', ['\u25BE ' + label], '', { group: collapsed ? 'collapsed' : 'open' });
-      ctx.groupDepth++;
-      try { nativeCon[method].apply(null, arguments); } catch (e) { /* noop */ }
+      var a = arguments;
+      safe(function () {
+        var label = (a.length && serialize(a[0], 0)) || 'group';
+        conEmit('log', ['\u25BE ' + label], '', { group: collapsed ? 'collapsed' : 'open' });
+        ctx.groupDepth++;
+      }, 'console.' + method)();
+      try { nativeCon[method].apply(null, a); } catch (e) { /* noop */ }
     });
   }
   groupPatch('group', false);
   groupPatch('groupCollapsed', true);
   patch('groupEnd', function () {
-    ctx.groupDepth = Math.max(0, ctx.groupDepth - 1);
+    safe(function () { ctx.groupDepth = Math.max(0, ctx.groupDepth - 1); }, 'console.groupEnd')();
     try { nativeCon.groupEnd(); } catch (e) { /* noop */ }
   });
 
   patch('trace', function () {
-    var stack = '';
-    try { stack = String(new Error().stack || '').split('\n').slice(1, 7).join('\n'); } catch (e) { /* noop */ }
-    var msg = arguments.length ? Array.prototype.map.call(arguments, function (a) { return serialize(a, 0); }).join(' ') : 'console.trace';
-    conEmit('log', [msg], '', { stack: stack || '(stack unavailable)' });
+    var a = arguments;
+    safe(function () {
+      var stack = '';
+      try { stack = String(new Error().stack || '').split('\n').slice(1, 7).join('\n'); } catch (e) { /* noop */ }
+      var msg = a.length ? Array.prototype.map.call(a, function (x) { return serialize(x, 0); }).join(' ') : 'console.trace';
+      conEmit('log', [msg], '', { stack: stack || '(stack unavailable)' });
+    }, 'console.trace')();
     try { nativeCon.trace(); } catch (e) { /* noop */ }
   });
 
   patch('dir', function (obj) {
-    conEmit('log', [obj], 'dir');
+    safe(function () { conEmit('log', [obj], 'dir'); }, 'console.dir')();
     try { nativeCon.dir(obj); } catch (e) { /* noop */ }
   });
   patch('assert', function (cond) {
-    if (!cond) {
-      var rest = Array.prototype.slice.call(arguments, 1);
-      conEmit('error', ['Assertion failed: ' + (rest.length ? rest.map(function (a) { return serialize(a, 0); }).join(' ') : 'console.assert')]);
-    }
-    try { nativeCon.assert.apply(null, arguments); } catch (e) { /* noop */ }
+    var a = arguments;
+    safe(function () {
+      if (!cond) {
+        var rest = Array.prototype.slice.call(a, 1);
+        conEmit('error', ['Assertion failed: ' + (rest.length ? rest.map(function (x) { return serialize(x, 0); }).join(' ') : 'console.assert')]);
+      }
+    }, 'console.assert')();
+    try { nativeCon.assert.apply(null, a); } catch (e) { /* noop */ }
   });
   patch('clear', function () {
-    conClear();
+    safe(conClear, 'console.clear')();
     try { nativeCon.clear(); } catch (e) { /* noop */ }
   });
 
-  window.addEventListener('error', function (ev) {
-    if (ev.message && ev.message.indexOf('pdt-host') >= 0) return; /* our own UI errors — ignore spillover */
-    var loc = '';
-    try { if (ev.filename) loc = ' @ ' + String(ev.filename).split('/').pop() + ':' + ev.lineno; } catch (e) { /* noop */ }
-    conEmit('error', [(ev.message || 'Script error') + loc]);
+  /* window error handlers — wrapped so a hostile error reason can never
+   * start an error -> handler -> error loop */
+  onEvt(window, 'error', function (ev) {
+    safe(function () {
+      if (ev && ev.message && String(ev.message).indexOf('pdt-host') >= 0) return; /* our own UI errors */
+      var loc = '';
+      try { if (ev.filename) loc = ' @ ' + String(ev.filename).split('/').pop() + ':' + ev.lineno; } catch (e) { /* noop */ }
+      conEmit('error', [((ev && ev.message) || 'Script error') + loc]);
+    }, 'window.onerror')();
   }, true);
-  window.addEventListener('unhandledrejection', function (ev) {
-    var r = ev.reason;
-    var msg = (r && (r.stack || r.message)) || String(r);
-    conEmit('error', ['Unhandled promise rejection: ' + msg]);
+  onEvt(window, 'unhandledrejection', function (ev) {
+    safe(function () {
+      var r = ev && ev.reason;
+      var msg;
+      try { msg = (r && (r.stack || r.message)) || String(r); }
+      catch (e) { msg = '(unserializable rejection reason)'; }
+      conEmit('error', ['Unhandled promise rejection: ' + msg]);
+    }, 'unhandledrejection')();
   });
 
   installConsoleHelpers();
@@ -1314,11 +1702,15 @@ function conEntryNode(entry) {
   if (entry.depth) row.style.paddingLeft = (10 + entry.depth * 16) + 'px';
   if (entry.group) { row.classList.add('group-head'); }
 
-  /* object inspector toggle */
-  if (entry.val && isExpandable(entry.val)) {
-    var toggle = h('button.pdt-otog', objPreview(entry.val));
+  /* object inspector toggle — hostile values must never break rendering */
+  var hasVal = false;
+  try { hasVal = !!(entry.val && isExpandable(entry.val)); } catch (e) { hasVal = false; }
+  if (hasVal) {
+    var pv = '{…}';
+    try { pv = objPreview(entry.val); } catch (e) { /* hostile */ }
+    var toggle = h('button.pdt-otog', pv);
     var built = false;
-    toggle.addEventListener('click', function (e) {
+    toggle.addEventListener('click', safe(function (e) {
       e.stopPropagation();
       if (!built) {
         built = true;
@@ -1329,23 +1721,25 @@ function conEntryNode(entry) {
           if (kind === 'array' || kind === 'object') {
             var keys = kind === 'array' ? entry.val.map(function (_, i) { return String(i); }) : Object.keys(entry.val);
             keys.slice(0, 100).forEach(function (k) { pairs.push([k, kind === 'array' ? entry.val[Number(k)] : entry.val[k]]); });
-          } else if (kind === 'map') { entry.val.forEach(function (v, k) { pairs.push([serialize(k, 1), v]); }); }
-          else if (kind === 'set') { entry.val.forEach(function (v, i) { pairs.push([String(i), v]); }); }
+          } else if (kind === 'map') { entry.val.forEach(function (v, k) { if (pairs.length < 100) pairs.push([serialize(k, 1), v]); }); }
+          else if (kind === 'set') { entry.val.forEach(function (v, i) { if (pairs.length < 100) pairs.push([String(i), v]); }); }
         } catch (e2) { /* locked */ }
         pairs.forEach(function (p) { wrap.appendChild(objTreeNode(p[0], p[1], 0)); });
         x.appendChild(wrap);
         toggle.classList.add('open');
-        toggle.textContent = '\u25BE ' + objPreview(entry.val);
+        var t2 = '{…}'; try { t2 = objPreview(entry.val); } catch (e3) { /* hostile */ }
+        toggle.textContent = '\u25BE ' + t2;
       } else {
         var tr = x.querySelector('.pdt-otree');
         if (tr) {
           var show = tr.style.display === 'none';
           tr.style.display = show ? '' : 'none';
           toggle.classList.toggle('open', show);
-          toggle.textContent = (show ? '\u25BE ' : '\u25B8 ') + objPreview(entry.val);
+          var t3 = '{…}'; try { t3 = objPreview(entry.val); } catch (e4) { /* hostile */ }
+          toggle.textContent = (show ? '\u25BE ' : '\u25B8 ') + t3;
         }
       }
-    });
+    }, 'con.inspect'));
     x.appendChild(toggle);
   }
   if (!conPassesFilter(entry)) row.classList.add('hide');
@@ -1362,7 +1756,10 @@ function conRenderNew() {
   if (!conListEl) return;
   var nearBottom = conListEl.scrollHeight - conListEl.scrollTop - conListEl.clientHeight < 60;
   var frag = document.createDocumentFragment();
-  for (var i = ctx.conRendered; i < ctx.conEntries.length; i++) frag.appendChild(conEntryNode(ctx.conEntries[i]));
+  for (var i = ctx.conRendered; i < ctx.conEntries.length; i++) {
+    try { frag.appendChild(conEntryNode(ctx.conEntries[i])); }
+    catch (e) { pdError(e, 'conNode'); }   /* one bad entry must not kill the batch */
+  }
   ctx.conRendered = ctx.conEntries.length;
   conListEl.appendChild(frag);
   while (conListEl.children.length > settings.maxConsole) conListEl.removeChild(conListEl.firstChild);
@@ -1516,6 +1913,8 @@ var EVT_CAP = 5000;
   try {
     var AEL = EventTarget.prototype.addEventListener;
     var REL = EventTarget.prototype.removeEventListener;
+    natives.ael = AEL; natives.rel = REL;
+    stab().diag.ael = true;
     EventTarget.prototype.addEventListener = function (type, fn, opts) {
       try {
         if (typeof fn === 'function' && evtListeners.length < EVT_CAP) {
@@ -1526,7 +1925,7 @@ var EVT_CAP = 5000;
             passive: !!(opts && typeof opts === 'object' && opts.passive)
           });
         }
-      } catch (e) { /* noop */ }
+      } catch (e) { /* hostile target */ }
       return AEL.apply(this, arguments);
     };
     EventTarget.prototype.removeEventListener = function (type, fn, opts) {
@@ -1536,7 +1935,7 @@ var EVT_CAP = 5000;
           var L = evtListeners[i];
           if (L.el === this && L.type === type && L.fn === fn && L.capture === cap) { evtListeners.splice(i, 1); break; }
         }
-      } catch (e) { /* noop */ }
+      } catch (e) { /* hostile target */ }
       return REL.apply(this, arguments);
     };
   } catch (e) { /* prototype locked */ }
@@ -1588,6 +1987,21 @@ function xpathFor(el) {
 /* ---------------- inspect mode ---------------- */
 function toggleInspect() { inspectOn ? stopInspect(true) : startInspect(); }
 
+/* stable safe()-wrapped references — add/removeEventListener need the SAME
+ * function object, so the wrappers are created exactly once */
+var inspFns = null;
+function inspHandlers() {
+  if (!inspFns) {
+    inspFns = {
+      touch: safe(inspTouch, 'insp.touch'),
+      end: safe(inspEnd, 'insp.end'),
+      mouse: safe(inspMouse, 'insp.mouse'),
+      click: safe(inspClick, 'insp.click')
+    };
+  }
+  return inspFns;
+}
+
 function startInspect() {
   if (inspectOn) return;
   inspectOn = true;
@@ -1598,26 +2012,30 @@ function startInspect() {
   ovlLabel.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483647;display:none;' +
     'background:#1e1f24;color:#fff;font:600 11px/1.4 -apple-system,Roboto,sans-serif;padding:3px 8px;' +
     'border-radius:6px;white-space:nowrap;max-width:90vw;overflow:hidden;text-overflow:ellipsis';
-  document.body.appendChild(ovlBox);
-  document.body.appendChild(ovlLabel);
-  document.addEventListener('touchstart', inspTouch, true);
-  document.addEventListener('touchmove', inspTouch, true);
-  document.addEventListener('touchend', inspEnd, true);
-  document.addEventListener('mousemove', inspMouse, true);
-  document.addEventListener('click', inspClick, true);
+  (document.body || document.documentElement).appendChild(ovlBox);
+  (document.body || document.documentElement).appendChild(ovlLabel);
+  var F = inspHandlers();
+  document.addEventListener('touchstart', F.touch, true);
+  document.addEventListener('touchmove', F.touch, true);
+  document.addEventListener('touchend', F.end, true);
+  document.addEventListener('touchcancel', F.end, true);
+  document.addEventListener('mousemove', F.mouse, true);
+  document.addEventListener('click', F.click, true);
   toast('Inspect: touch an element, release to select');
-  var b = root.querySelector('.pdt-ib[title="Inspect element"]');
+  var b = root ? root.querySelector('.pdt-ib[title="Inspect element"]') : null;
   if (b) b.style.color = 'var(--accent)';
 }
 
 function stopInspect(cancel) {
   if (!inspectOn) return;
   inspectOn = false;
-  document.removeEventListener('touchstart', inspTouch, true);
-  document.removeEventListener('touchmove', inspTouch, true);
-  document.removeEventListener('touchend', inspEnd, true);
-  document.removeEventListener('mousemove', inspMouse, true);
-  document.removeEventListener('click', inspClick, true);
+  var F = inspHandlers();
+  document.removeEventListener('touchstart', F.touch, true);
+  document.removeEventListener('touchmove', F.touch, true);
+  document.removeEventListener('touchend', F.end, true);
+  document.removeEventListener('touchcancel', F.end, true);
+  document.removeEventListener('mousemove', F.mouse, true);
+  document.removeEventListener('click', F.click, true);
   if (ovlBox) { ovlBox.remove(); ovlBox = null; }
   if (ovlLabel) { ovlLabel.remove(); ovlLabel = null; }
   var b = root ? root.querySelector('.pdt-ib[title="Inspect element"]') : null;
@@ -1651,8 +2069,11 @@ function drawHighlight(el) {
   ovlLabel.style.top = (r.top > 30 ? (r.top - 26) : (r.bottom + 6)) + 'px';
 }
 
-var inspLast = null, inspStart = null;
+var inspLast = null, inspStart = null, inspTouchAt = 0;
 function inspTouch(e) {
+  inspTouchAt = Date.now();          /* Firefox does not set pointerType on the
+                                     * click that follows a tap — remember the
+                                     * touch so inspClick can ignore it */
   var t = e.touches[0];
   if (!t) return;
   if (!inspStart) inspStart = { x: t.clientX, y: t.clientY, t: Date.now() };
@@ -1660,6 +2081,11 @@ function inspTouch(e) {
   drawHighlight(inspLast);
 }
 function inspEnd(e) {
+  inspTouchAt = Date.now();
+  if (e && e.type === 'touchcancel') { /* gesture aborted (browser took over,
+    scroll happened) — cancel quietly, never select on cancel */
+    inspStart = null; inspLast = null; return;
+  }
   var st = inspStart; inspStart = null;
   var el = inspLast; inspLast = null;
   if (!el) return;
@@ -1680,7 +2106,9 @@ function inspMouse(e) {
   drawHighlight(inspLast);
 }
 function inspClick(e) {
-  if (e.pointerType === 'touch') return;
+  /* Chrome marks touch-driven clicks with pointerType; Firefox leaves it
+   * undefined, so also skip clicks that immediately follow a touch. */
+  if (e.pointerType === 'touch' || Date.now() - inspTouchAt < 800) return;
   e.preventDefault(); e.stopPropagation();
   if (inspLast) { selectElement(inspLast); stopInspect(false); }
 }
@@ -2261,6 +2689,8 @@ registerPanel({
 
 var netListEl = null, netDetailId = null, netFilterType = 'all', netSearchVal = '';
 var netRenderQueued = false;
+var netRowsById = {};   /* entry id -> row element (incremental rendering) */
+var netCountEl = null;  /* the "N req" counter, updated in place */
 
 function netNow() { return (performance && performance.now) ? performance.now() : Date.now(); }
 
@@ -2284,6 +2714,7 @@ function netAdd(type, meta) {
   e.duration = (e.duration != null) ? e.duration : null;
   e.error = e.error || null;
   e.msgs = e.msgs || 0;
+  e._dirty = true;   /* row not yet rendered / needs refresh */
   e.t = Date.now();
   ctx.netEntries.push(e);
   if (ctx.netEntries.length > 300) ctx.netEntries.splice(0, ctx.netEntries.length - 300);
@@ -2291,9 +2722,9 @@ function netAdd(type, meta) {
   return e;
 }
 function netTouch() {
-  if (!netRenderQueued && panelEls.network) {
+  if (!netRenderQueued && panelEls.network && netDetailId == null) {
     netRenderQueued = true;
-    requestAnimationFrame(function () { netRenderQueued = false; renderNetList(); });
+    requestAnimationFrame(safe(function () { netRenderQueued = false; netSyncList(); }, 'netSync'));
   }
 }
 
@@ -2365,44 +2796,67 @@ function reqBodyText(body) {
     var XO = XMLHttpRequest.prototype.open,
         XS = XMLHttpRequest.prototype.send,
         XH = XMLHttpRequest.prototype.setRequestHeader;
+    natives.xhrOpen = XO; natives.xhrSend = XS; natives.xhrSetHeader = XH;
+    stab().diag.xhr = true;
 
     XMLHttpRequest.prototype.open = function (m, u) {
-      this.__pdt = { method: String(m || 'GET').toUpperCase(), url: String(u || ''), reqHeaders: {} };
+      var self = this;
+      safe(function () {
+        self.__pdt = { method: String(m || 'GET').toUpperCase(), url: String(u || ''), reqHeaders: {} };
+      }, 'xhr.open')();
       return XO.apply(this, arguments);
     };
     XMLHttpRequest.prototype.setRequestHeader = function (k, v) {
-      if (this.__pdt) this.__pdt.reqHeaders[k] = v;
+      var self = this;
+      safe(function () {
+        if (self.__pdt) {
+          try { self.__pdt.reqHeaders[String(k)] = String(v); } catch (e) { /* hostile header */ }
+        }
+      }, 'xhr.setHeader')();
       return XH.apply(this, arguments);
     };
     XMLHttpRequest.prototype.send = function (body) {
-      var xhr = this, meta = xhr.__pdt || (xhr.__pdt = { method: 'GET', url: '', reqHeaders: {} });
-      meta.start = netNow();
-      meta.reqBody = reqBodyText(body);
-      if (isBlocked(meta.url)) {
-        meta.pending = false;
-        meta.blocked = true;
-        meta.status = null;
-        meta.duration = 0;
-        meta.error = 'Blocked by Pocket DevTools request blocker';
-        netAdd('XHR', meta);
-        try { this.abort(); } catch (e) { /* noop */ }
-        return;
+      var xhr = this;
+      var meta = xhr.__pdt;
+      if (!meta) {
+        try { meta = xhr.__pdt = { method: 'GET', url: '', reqHeaders: {} }; } catch (e) { meta = null; }
       }
-      var entry = netAdd('XHR', meta);
-      xhr.addEventListener('loadend', function () {
-        meta.pending = false;
-        meta.status = xhr.status;
-        meta.finalUrl = xhr.responseURL || meta.url;
-        meta.duration = netNow() - meta.start;
-        try { meta.resHeaders = xhr.getAllResponseHeaders() || null; } catch (e) { /* noop */ }
-        try {
-          var rt = xhr.responseText;
-          meta.size = rt ? rt.length : (xhr.response && xhr.response.size) || null;
-          if (rt && (!settings.netBodyLimit || rt.length <= settings.netBodyLimit)) meta.resBody = rt;
-          else if (rt) meta.resBody = truncate(rt, settings.netBodyLimit || 0) + '\n… (truncated)';
-        } catch (e) { meta.resBody = '[binary or blocked response: ' + (xhr.responseType || 'unknown') + ']'; }
-        if (entry) { netTouch(); }
-      });
+      if (meta) {
+        safe(function () {
+          meta.start = netNow();
+          meta.reqBody = reqBodyText(body);
+          if (isBlocked(meta.url)) {
+            meta.pending = false;
+            meta.blocked = true;
+            meta.status = null;
+            meta.duration = 0;
+            meta.error = 'Blocked by Pocket DevTools request blocker';
+            netAdd('XHR', meta);
+            meta.blockedAbort = true;
+          } else {
+            netAdd('XHR', meta);
+          }
+        }, 'xhr.send')();
+        if (meta.blockedAbort) {
+          try { xhr.abort(); } catch (e) { /* noop */ }
+          return;
+        }
+        xhr.addEventListener('loadend', safe(function () {
+          meta.pending = false;
+          try { meta.status = xhr.status; } catch (e) { meta.status = null; }
+          try { meta.finalUrl = xhr.responseURL || meta.url; } catch (e) { /* noop */ }
+          meta.duration = netNow() - meta.start;
+          try { meta.resHeaders = xhr.getAllResponseHeaders() || null; } catch (e) { /* noop */ }
+          try {
+            var rt = xhr.responseText;
+            meta.size = rt ? rt.length : (xhr.response && xhr.response.size) || null;
+            if (rt && (!settings.netBodyLimit || rt.length <= settings.netBodyLimit)) meta.resBody = rt;
+            else if (rt) meta.resBody = truncate(rt, settings.netBodyLimit || 0) + '\n… (truncated)';
+          } catch (e) { meta.resBody = '[binary or blocked response: ' + (xhr.responseType || 'unknown') + ']'; }
+          meta._dirty = true;
+          netTouch();
+        }, 'xhr.loadend'));
+      }
       return XS.apply(this, arguments);
     };
   } catch (e) { conEmit('warn', ['DevTools: could not hook XMLHttpRequest']); }
@@ -2411,12 +2865,17 @@ function reqBodyText(body) {
   try {
     var OF = window.fetch;
     if (OF) {
+      natives.fetch = OF;
+      stab().diag.fetch = true;
       window.fetch = function (input, init) {
         var meta = {
           method: ((init && init.method) || (input && input.method) || 'GET').toUpperCase(),
-          url: (typeof input === 'string') ? input : (input && input.url) || String(input),
+          url: '',
           reqHeaders: {}, start: netNow()
         };
+        safe(function () {
+          meta.url = (typeof input === 'string') ? input : (input && input.url) || String(input);
+        }, 'fetch.url')();
         if (isBlocked(meta.url)) {
           netAdd('Fetch', {
             method: meta.method, url: meta.url, reqHeaders: {}, start: netNow(),
@@ -2435,32 +2894,47 @@ function reqBodyText(body) {
           } catch (e) { /* noop */ }
         }
         if (init && init.body != null) meta.reqBody = reqBodyText(init.body);
-        var entry = netAdd('Fetch', meta);
-        var p = OF.apply(this, arguments);
-        p.then(function (res) {
+        netAdd('Fetch', meta);
+        var p;
+        try { p = OF.apply(this, arguments); }
+        catch (err) {
+          /* fetch() itself threw (invalid URL, …) — record it, then let the
+           * page see exactly what it would have seen without us */
           meta.pending = false;
-          meta.status = res.status;
-          meta.finalUrl = res.url || meta.url;
+          meta.status = 0;
+          meta.error = (err && err.message) || 'fetch() threw';
+          meta.duration = netNow() - meta.start;
+          meta._dirty = true;
+          netTouch();
+          throw err;
+        }
+        p.then(safe(function (res) {
+          meta.pending = false;
+          try { meta.status = res.status; } catch (e) { meta.status = null; }
+          try { meta.finalUrl = res.url || meta.url; } catch (e) { /* noop */ }
           meta.duration = netNow() - meta.start;
           var rh = {};
           try { res.headers.forEach(function (v, k) { rh[k] = v; }); meta.resHeaders = rh; } catch (e) { /* noop */ }
           try {
             if (settings.netBodyLimit > 0) {
-              res.clone().text().then(function (t) {
+              res.clone().text().then(safe(function (t) {
                 meta.size = t ? t.length : 0;
                 meta.resBody = (t.length > settings.netBodyLimit) ? truncate(t, settings.netBodyLimit) + '\n… (truncated)' : t;
+                meta._dirty = true;
                 netTouch();
-              }, function () { /* body unreadable */ });
+              }, 'fetch.body'), safe(function () { /* body unreadable */ }, 'fetch.body.err'));
             }
           } catch (e) { /* noop */ }
+          meta._dirty = true;
           netTouch();
-        }, function (err) {
+        }, 'fetch.ok'), safe(function (err) {
           meta.pending = false;
           meta.status = 0;
           meta.error = (err && err.message) || 'network error';
           meta.duration = netNow() - meta.start;
+          meta._dirty = true;
           netTouch();
-        });
+        }, 'fetch.err'));
         return p;
       };
     }
@@ -2470,12 +2944,16 @@ function reqBodyText(body) {
   try {
     var OB = navigator.sendBeacon && navigator.sendBeacon.bind(navigator);
     if (OB) {
+      natives.beacon = navigator.sendBeacon;
+      stab().diag.beacon = true;
       navigator.sendBeacon = function (url, data) {
-        netAdd('Beacon', {
-          method: 'POST', url: String(url), reqBody: reqBodyText(data),
-          pending: false, status: isBlocked(url) ? null : 204, blocked: isBlocked(url),
-          duration: 0, error: isBlocked(url) ? 'Blocked by request blocker' : null
-        });
+        safe(function () {
+          netAdd('Beacon', {
+            method: 'POST', url: String(url), reqBody: reqBodyText(data),
+            pending: false, status: isBlocked(url) ? null : 204, blocked: isBlocked(url),
+            duration: 0, error: isBlocked(url) ? 'Blocked by request blocker' : null
+          });
+        }, 'sendBeacon')();
         if (isBlocked(url)) return true;
         return OB(url, data);
       };
@@ -2486,20 +2964,28 @@ function reqBodyText(body) {
   try {
     var WS = window.WebSocket;
     if (WS) {
+      natives.ws = WS;
+      stab().diag.ws = true;
       var PWS = function (url, protocols) {
         var ws = (protocols !== undefined) ? new WS(url, protocols) : new WS(url);
-        var e = netAdd('WS', { method: 'WS', url: String(url), pending: false, status: 101, resBody: '' });
+        var e = null;
+        safe(function () {
+          e = netAdd('WS', { method: 'WS', url: String(url), pending: false, status: 101, resBody: '' });
+        }, 'ws.new')();
         if (e) {
-          ws.addEventListener('open', function () { e.resBody = '[connected]\n'; netTouch(); });
-          ws.addEventListener('close', function () { e.status = 1006; e.resBody += '[closed]\n'; e.duration = netNow() - e.start; netTouch(); });
-          ws.addEventListener('error', function () { e.error = 'WebSocket error'; netTouch(); });
-          ws.addEventListener('message', function (ev) {
+          ws.addEventListener('open', safe(function () { e.resBody = '[connected]\n'; e._dirty = true; netTouch(); }, 'ws.open'));
+          ws.addEventListener('close', safe(function () { e.status = 1006; e.resBody += '[closed]\n'; e.duration = netNow() - e.start; e._dirty = true; netTouch(); }, 'ws.close'));
+          ws.addEventListener('error', safe(function () { e.error = 'WebSocket error'; e._dirty = true; netTouch(); }, 'ws.error'));
+          ws.addEventListener('message', safe(function (ev) {
             e.msgs++;
             var d = (typeof ev.data === 'string') ? ev.data : '[binary frame]';
             e.resBody += '\u2193 ' + truncate(d, 300) + '\n';
+            /* chatty sockets must not grow the buffer without bound */
+            if (e.resBody.length > 12288) e.resBody = '\u2026\n' + e.resBody.slice(-10240);
             e.size = (e.size || 0) + d.length;
+            e._dirty = true;
             netTouch();
-          });
+          }, 'ws.msg'));
         }
         return ws;
       };
@@ -2513,7 +2999,12 @@ function reqBodyText(body) {
   } catch (e) { conEmit('warn', ['DevTools: could not hook WebSocket']); }
 })();
 
-/* ---------------- rendering ---------------- */
+/* ---------------- rendering ----------------
+ * Two paths:
+ *   renderNetList() — full rebuild (filter/search change, panel rebuild)
+ *   netSyncList()   — incremental: prepends new rows, patches changed rows
+ *                     in place, evicts dropped ones. Called at most once per
+ *                     animation frame, so busy pages never jank the panel. */
 function netPasses(e) {
   if (netFilterType !== 'all' && e.type.toLowerCase() !== netFilterType) return false;
   if (netSearchVal && e.url.toLowerCase().indexOf(netSearchVal.toLowerCase()) < 0) return false;
@@ -2523,6 +3014,7 @@ function netPasses(e) {
 function renderNetList() {
   if (!netListEl) return;
   netListEl.textContent = '';
+  netRowsById = {};
   var shown = ctx.netEntries.filter(netPasses);
   if (!shown.length) {
     netListEl.appendChild(h('.pdt-empty', ctx.netEntries.length ?
@@ -2531,8 +3023,67 @@ function renderNetList() {
     return;
   }
   var frag = document.createDocumentFragment();
-  for (var i = shown.length - 1; i >= 0; i--) frag.appendChild(netRow(shown[i]));
+  for (var i = shown.length - 1; i >= 0; i--) {
+    var row = netRow(shown[i]);
+    netRowsById[shown[i].id] = row;
+    shown[i]._dirty = false;
+    frag.appendChild(row);
+  }
   netListEl.appendChild(frag);
+}
+
+function netSyncList() {
+  if (!netListEl) return;
+  /* evict rows whose entry fell out of the ring buffer (entries are spliced
+   * from the front, so anything older than the oldest live id is stale) */
+  var minLive = ctx.netEntries.length ? ctx.netEntries[0].id : Infinity;
+  for (var k in netRowsById) {
+    if (Number(k) < minLive) {
+      var rm = netRowsById[k];
+      if (rm && rm.parentNode) rm.parentNode.removeChild(rm);
+      delete netRowsById[k];
+    }
+  }
+  /* patch changed rows (pending -> done, size/duration updates) */
+  for (var i = 0; i < ctx.netEntries.length; i++) {
+    var e = ctx.netEntries[i];
+    var row = netRowsById[e.id];
+    if (row && e._dirty) {
+      var nu = netRow(e);
+      netRowsById[e.id] = nu;
+      e._dirty = false;
+      if (row.parentNode) row.parentNode.replaceChild(nu, row);
+    }
+  }
+  /* prepend new rows — newest first, like the full render */
+  var frag = null;
+  for (var j = 0; j < ctx.netEntries.length; j++) {
+    var en = ctx.netEntries[j];
+    if (!netRowsById[en.id] && netPasses(en)) {
+      var r = netRow(en);
+      netRowsById[en.id] = r;
+      en._dirty = false;
+      if (!frag) frag = document.createDocumentFragment();
+      frag.insertBefore(r, frag.firstChild);
+    }
+  }
+  if (frag) {
+    var emp = netListEl.querySelector('.pdt-empty');
+    if (emp) emp.remove();
+    netListEl.insertBefore(frag, netListEl.firstChild);
+  }
+  /* hard DOM cap — the buffer holds 300, so does the list */
+  while (netListEl.children.length > 300) {
+    var last = netListEl.lastChild;
+    if (!last) break;
+    netListEl.removeChild(last);
+  }
+  if (!netListEl.children.length) {
+    netListEl.appendChild(h('.pdt-empty', ctx.netEntries.length ?
+      'No requests match the current filter' :
+      'No requests captured yet.\nRequests made after DevTools loaded appear here.'));
+  }
+  if (netCountEl) netCountEl.textContent = ctx.netEntries.length + ' req';
 }
 
 function netRow(e) {
@@ -2552,7 +3103,8 @@ function netRow(e) {
     h('span.m', (e.duration != null ? fmtMs(e.duration) : '—') + ' · ' + (e.size != null ? fmtBytes(e.size) : '—'))
   ]);
   var row = h('.pdt-nrow2', [left, right]);
-  row.addEventListener('click', function () { netDetailId = e.id; renderNetDetail(); });
+  try { row.dataset.nid = e.id; } catch (er) { /* noop */ }
+  row.addEventListener('click', safe(function () { netDetailId = e.id; renderNetDetail(); }, 'netRow.click'));
   return row;
 }
 
@@ -2726,8 +3278,9 @@ function renderNetPanel() {
   });
   var search = h('input.pdt-input.pdt-grow', { type: 'search', placeholder: 'Filter URL' });
   search.addEventListener('input', debounce(function () { netSearchVal = search.value; renderNetList(); }, 200));
-  var count = h('span', { style: { color: 'var(--muted)', fontSize: '.85em', flex: 'none' } },
+  netCountEl = h('span', { style: { color: 'var(--muted)', fontSize: '.85em', flex: 'none' } },
     ctx.netEntries.length + ' req');
+  var count = netCountEl;
 
   var pauseBtn = h('button.pdt-ib', { type: 'button', title: ctx.netPaused ? 'Resume capture' : 'Pause capture' }, iconEl(ctx.netPaused ? 'play' : 'pause'));
   pauseBtn.addEventListener('click', function () {
@@ -2745,7 +3298,7 @@ function renderNetPanel() {
   panel.appendChild(h('.pdt-toolbar', [
     chips.all, chips.xhr, chips.fetch, chips.ws, search, count, pauseBtn, blockBtn,
     h('button.pdt-ib', { type: 'button', title: 'Export HAR', onclick: exportHar }, iconEl('save')),
-    h('button.pdt-ib', { type: 'button', title: 'Clear', onclick: function () { ctx.netEntries = []; renderNetPanel(); } }, iconEl('trash'))
+    h('button.pdt-ib', { type: 'button', title: 'Clear', onclick: function () { ctx.netEntries = []; netRowsById = {}; renderNetPanel(); } }, iconEl('trash'))
   ]));
   netListEl = h('.pdt-scroll', { style: { padding: '0' } });
   panel.appendChild(netListEl);
@@ -4096,15 +4649,17 @@ function startFps() {
   fpsRunning = true; fpsFrames = []; fpsLast = 0;
   function loop(t) {
     if (!fpsRunning) return;
-    if (fpsLast) {
-      fpsFrames.push(t - fpsLast);
-      if (fpsFrames.length > 90) fpsFrames.shift();
-      drawFps();
-    }
-    fpsLast = t;
-    fpsRafId = requestAnimationFrame(loop);
+    try {
+      if (fpsLast) {
+        fpsFrames.push(t - fpsLast);
+        if (fpsFrames.length > 90) fpsFrames.shift();
+        drawFps();
+      }
+      fpsLast = t;
+    } catch (e) { pdError(e, 'fps.loop'); }
+    fpsRafId = requestAnimationFrame(safe(loop, 'fps.loop'));
   }
-  fpsRafId = requestAnimationFrame(loop);
+  fpsRafId = requestAnimationFrame(safe(loop, 'fps.loop'));
 }
 function stopFps() {
   fpsRunning = false;
@@ -4141,13 +4696,13 @@ var longTasks = [], longTaskObs = null;
 function ensureLongTaskObserver() {
   if (longTaskObs) return true;
   try {
-    longTaskObs = new PerformanceObserver(function (list) {
+    longTaskObs = new PerformanceObserver(safe(function (list) {
       list.getEntries().forEach(function (e) {
         longTasks.push({ start: e.startTime, dur: e.duration, name: e.name || 'task' });
         if (longTasks.length > 200) longTasks.shift();
       });
       if (perfSub === 'tasks' && panelEls.perf) renderPerfPanel();
-    });
+    }, 'longtask'));
     longTaskObs.observe({ entryTypes: ['longtask'] });
     return true;
   } catch (e) {
@@ -5817,11 +6372,16 @@ function renderSettingsPanel() {
   /* --- FAB --- */
   var fabRow = h('.pdt-card', [
     kv('Show floating button', settings.showFAB ? 'on' : 'off'),
-    h('button.pdt-btn' + (settings.showFAB ? '.on' : ''), { type: 'button', style: { marginTop: '8px' } }, settings.showFAB ? 'Hide FAB' : 'Show FAB')
+    h('.pdt-mtext', { style: { fontSize: '.82em', marginTop: '6px' } },
+      'Tap the icon to open the tools; drag it anywhere. Its small \u00D7 badge hides it ' +
+      'for the current page load \u2014 refreshing or re-tapping the bookmarklet brings it back. ' +
+      'The switch below is permanent (survives refresh).'),
+    h('button.pdt-btn' + (settings.showFAB ? '.on' : ''), { type: 'button', style: { marginTop: '8px' } }, settings.showFAB ? 'Hide FAB permanently' : 'Show FAB')
   ]);
   var fabBtn = fabRow.querySelector('button');
   fabBtn.addEventListener('click', function () {
     settings.showFAB = !settings.showFAB;
+    ctx.fabHidden = false;
     saveSettings();
     positionFab();
     renderSettingsPanel();
@@ -5935,6 +6495,47 @@ function renderSettingsPanel() {
     } }, [iconEl('copy', 14), 'Copy diagnostics'])
   ]));
 
+  /* --- diagnostics & health --- */
+  sc.appendChild(h('.pdt-label', [iconEl('shield', 14), ' Diagnostics & health']));
+  var diagCard = h('.pdt-card');
+  var D = collectDiagnostics();
+  diagCard.appendChild(kv('Hooks (console / fetch / XHR)',
+    D.hooks.console + ' / ' + D.hooks.fetch + ' / ' + D.hooks.xhr));
+  diagCard.appendChild(kv('Hooks (WS / beacon / listeners)',
+    D.hooks.websocket + ' / ' + D.hooks.sendBeacon + ' / ' + D.hooks.listenerCapture));
+  diagCard.appendChild(kv('Stylesheet', D.stylesheet));
+  diagCard.appendChild(kv('Storage (local / session / cookies)',
+    D.storage.localStorage + ' / ' + D.storage.sessionStorage + ' / ' + D.storage.cookies));
+  diagCard.appendChild(kv('Captured (console / network / listeners)',
+    D.captured.consoleEntries + ' / ' + D.captured.networkEntries + ' / ' + D.captured.domListeners));
+  diagCard.appendChild(kv('Internal errors caught', String(D.internalErrors.count)));
+  diagCard.appendChild(kv('JS heap', D.jsHeap));
+  diagCard.appendChild(kv('Uptime', D.uptime));
+  if (D.internalErrors.count) {
+    var errList = h('pre.pdt-mono', { style: { fontSize: '.78em', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--fg2)', margin: '6px 0 0' } });
+    errList.textContent = D.internalErrors.last.map(function (er) {
+      return '[' + fmtTime(er.t) + '] ' + er.where + ': ' + truncate(er.msg, 160);
+    }).join('\n');
+    diagCard.appendChild(errList);
+  }
+  sc.appendChild(diagCard);
+  sc.appendChild(h('.pdt-row', { style: { flexWrap: 'wrap', marginTop: '8px' } }, [
+    h('button.pdt-btn', { type: 'button', onclick: function () {
+      copyText(JSON.stringify(collectDiagnostics(), null, 2));
+    } }, [iconEl('copy', 14), 'Copy report']),
+    h('button.pdt-btn', { type: 'button', onclick: function () {
+      restartUI();
+    } }, [iconEl('refresh', 14), 'Restart UI']),
+    h('button.pdt-btn.danger', { type: 'button', onclick: function () {
+      confirmModal('Unload Pocket DevTools completely?', 'Unload', function () {
+        destroyTool();
+      }, true);
+    } }, [iconEl('xc', 14), 'Unload'])
+  ]));
+  sc.appendChild(h('.pdt-mtext', { style: { fontSize: '.82em' } },
+    'Restart UI rebuilds the panel without touching hooks or captured data — use it if anything looks wedged. ' +
+    'Unload removes every hook, button and listener, restoring the page to its pre-injection state (tap the bookmarklet to start again).'));
+
   /* --- about --- */
   sc.appendChild(h('.pdt-label', 'About'));
   sc.appendChild(h('.pdt-card', [
@@ -5956,14 +6557,28 @@ registerPanel({
 
 /* ===== 19-footer.js ===== */
 /*
- * 16-footer.js — boot sequence and public API
+ * 19-footer.js — boot sequence and public API
  */
+
+/* Drop every module-level element reference so a rebuilt shell starts clean.
+ * All names live in the shared IIFE scope, so this one function can reset
+ * them all. Used by restartUI() and destroyTool(). */
+function resetPanelRefs() {
+  hostEl = root = app = sheetEl = tabsEl = bodyEl = fabEl = null;
+  panelEls = {};
+  conListEl = null; conInputEl = null;
+  netListEl = null; netDetailId = null; netCountEl = null; netRowsById = {};
+  elTreeEl = elDetailEl = elEvEl = null;
+  fpsNumEl = fpsCanvasEl = null;
+  ctx.conRendered = 0;
+}
 
 function start() {
   document.removeEventListener('DOMContentLoaded', start);
   try {
     buildShell();
   } catch (e) {
+    pdError(e, 'boot');
     try { nativeCon.error && nativeCon.error('Pocket DevTools failed to start: ' + (e && (e.message || e))); } catch (e2) { /* noop */ }
     return;
   }
@@ -5979,7 +6594,7 @@ function boot() {
    * installed (they run at script evaluation, before this line). The UI needs
    * a parsed document, so defer the shell until the DOM is ready. */
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', start);
+    document.addEventListener('DOMContentLoaded', safe(start, 'DOMContentLoaded'));
     return;
   }
   start();
@@ -5992,6 +6607,8 @@ window.__POCKET_DEVTOOLS__ = {
   toggle: function () { toggleSheet(); },
   open: function () { openSheet(); },
   close: function () { closeSheet(); },
+  hideFab: function () { hideFab(true); return 'Floating icon hidden for this page load'; },
+  showFab: function () { showFab(); return 'Floating icon restored'; },
   inspect: function () { toggleInspect(); },
   select: function (el) { selectElement(el); },
   tab: function (id) { switchTab(id); },
@@ -6015,10 +6632,15 @@ window.__POCKET_DEVTOOLS__ = {
   blocklist: function () { return ctx.blockList.slice(); },
   $0: function () { return ctx.selected; },
   clearConsole: conClear,
+  /* --- stability API (v5.2) --- */
+  diagnostics: function () { return collectDiagnostics(); },
+  errors: function () { return stab().errors.slice(); },
+  restartUI: function () { restartUI(); return 'UI restarted'; },
+  destroy: function () { destroyTool(); return 'Pocket DevTools unloaded'; },
   /* debug/testing handle */
   _app: function () { return app; },
   _dump: function () {
-    var active = app.querySelector('.pdt-panel.on');
+    var active = app ? app.querySelector('.pdt-panel.on') : null;
     return JSON.stringify({
       activeTab: ctx.activeTab,
       panels: Object.keys(panelEls),

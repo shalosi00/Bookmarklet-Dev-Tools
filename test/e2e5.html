@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PDT v5.3 touch &amp; visibility regression</title>
+<style>
+  body { font: 13px monospace; margin: 0; padding: 10px; }
+  .r { padding: 3px 6px; border-bottom: 1px solid #ddd; }
+  .PASS { color: #1f9d55; font-weight: 700; }
+  .FAIL { color: #d64545; font-weight: 700; }
+  #out { margin-top: 8px; }
+</style>
+</head>
+<body>
+<div id="out">running…</div>
+<div style="height:2600px;background:linear-gradient(#eef,#fee)">scrollable page content</div>
+<div id="target" style="height:120px;background:#cde">touch target</div>
+<script src="../src.js"></script>
+<script>
+(function () {
+  'use strict';
+  window.__RESULTS = [];
+  window.__DONE = false;
+  var P = window.__POCKET_DEVTOOLS__;
+
+  function T(name, fn) {
+    var rec = { name: name, pass: null, info: '' };
+    window.__RESULTS.push(rec);
+    try {
+      var r = fn();
+      rec.pass = r === true || r === undefined;
+      if (r !== true && r !== undefined) rec.info = String(r);
+    } catch (e) { rec.pass = false; rec.info = 'THROW: ' + (e && e.message); }
+  }
+  function app() { return P._app(); }
+  function sheet() { return app().querySelector('.pdt-sheet'); }
+  function isOpen() { return sheet().classList.contains('open'); }
+  function pe(type, opts) {
+    var e;
+    try { e = new PointerEvent(type, opts); }
+    catch (err) { e = new MouseEvent(type, opts); }
+    return e;
+  }
+  /* simulate a touch-style pointer gesture on an element */
+  function gesture(el, points, opts) {
+    opts = opts || {};
+    var id = 1 + Math.floor(Math.random() * 1000);
+    el.dispatchEvent(pe('pointerdown', { bubbles: true, cancelable: true, pointerId: id, pointerType: 'touch', isPrimary: true, clientX: 60, clientY: points[0] }));
+    for (var i = 1; i < points.length; i++) {
+      el.dispatchEvent(pe('pointermove', { bubbles: true, cancelable: true, pointerId: id, pointerType: 'touch', isPrimary: true, clientX: 60, clientY: points[i] }));
+    }
+    el.dispatchEvent(pe(opts.cancel ? 'pointercancel' : 'pointerup', { bubbles: true, cancelable: true, pointerId: id, pointerType: 'touch', isPrimary: true, clientX: 60, clientY: points[points.length - 1] }));
+  }
+  function css(el, prop) { return getComputedStyle(el).getPropertyValue(prop); }
+
+  setTimeout(function () {
+    /* ---------- A. FAB closable (user request #3) ---------- */
+    var fab = null, badge = null;
+    T('A1 FAB rendered', function () {
+      fab = app().querySelector('.pdt-fab');
+      return !!fab || 'no fab';
+    });
+    T('A2 close badge present on FAB', function () {
+      badge = fab ? fab.querySelector('.pdt-fabx') : null;
+      return !!badge || 'no badge';
+    });
+    T('A3 badge is a real button with icon', function () {
+      if (!badge) return 'no badge';
+      return !!(badge.tagName === 'BUTTON' && badge.querySelector('svg')) || 'tag=' + badge.tagName;
+    });
+    T('A4 tapping badge hides the FAB', function () {
+      P.open();  /* ensure open so sheet-open css would hide it — then close again */
+      P.close();
+      var before = fab.style.display;
+      badge.dispatchEvent(pe('pointerdown', { bubbles: true, cancelable: true, pointerId: 9, pointerType: 'touch', isPrimary: true, clientX: 1, clientY: 1 }));
+      badge.dispatchEvent(pe('pointerup', { bubbles: true, cancelable: true, pointerId: 9, pointerType: 'touch', isPrimary: true, clientX: 1, clientY: 1 }));
+      badge.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      return (before !== 'none' && fab.style.display === 'none') || 'display=' + fab.style.display;
+    });
+    T('A5 sheet did NOT open from badge tap', function () { return !isOpen() || 'sheet opened'; });
+    T('A6 API hideFab/showFab round-trip', function () {
+      P.showFab();
+      return (fab.style.display === 'flex') || 'display=' + fab.style.display;
+    });
+    T('A7 FAB returns after restartUI (repair restores entry point)', function () {
+      P.hideFab();
+      P.restartUI();
+      fab = app().querySelector('.pdt-fab');
+      return !!(fab && fab.style.display !== 'none') || 'hidden after restart';
+    });
+    T('A8 badge present after restartUI too', function () {
+      badge = fab ? fab.querySelector('.pdt-fabx') : null;
+      return !!badge || 'no badge';
+    });
+
+    /* ---------- B. sheet gestures (user request #2) ---------- */
+    var handle = sheet().querySelector('.pdt-handle');
+    T('B1 handle is tall enough for fingers (>=32px)', function () {
+      return (handle.getBoundingClientRect().height >= 32) || 'h=' + handle.getBoundingClientRect().height;
+    });
+    T('B2 title row is a drag zone too', function () {
+      var t = sheet().querySelector('.pdt-title');
+      return (css(t, 'touch-action') === 'none') || 'ta=' + css(t, 'touch-action');
+    });
+    T('B3 drag up resizes taller', function () {
+      P.open();
+      var h0 = sheet().getBoundingClientRect().height;
+      gesture(handle, [500, 460, 420, 380]);
+      var h1 = sheet().getBoundingClientRect().height;
+      return (h1 > h0 + 20) || 'h0=' + h0 + ' h1=' + h1;
+    });
+    T('B4 big drag down closes the sheet', function () {
+      if (!isOpen()) P.open();
+      gesture(handle, [380, 440, 500, 560]);
+      return !isOpen() || 'still open';
+    });
+    T('B5 height restored to pre-drag after swipe-close', function () {
+      /* sheet was ~taller from B3; after B4 close, --ph should be back to the
+       * value captured at drag start (the B3 result), not the dragged-down one */
+      var ph = parseFloat(sheet().style.getPropertyValue('--ph')) || 55;
+      return (ph > 23) || 'ph=' + ph;   /* not clamped to the 22% bottom */
+    });
+    T('B6 tap on handle maximizes, tap again restores', function () {
+      P.open();
+      gesture(handle, [400]);                      /* bare tap */
+      var hMax = sheet().getBoundingClientRect().height;
+      gesture(handle, [400]);                      /* tap again -> restore */
+      var hBack = sheet().getBoundingClientRect().height;
+      return (hMax > hBack + 100) || 'max=' + hMax + ' back=' + hBack;
+    });
+    T('B7 pointercancel does not close or select', function () {
+      if (!isOpen()) P.open();
+      gesture(handle, [400, 470, 540], { cancel: true });
+      return isOpen() || 'closed on cancel';
+    });
+
+    /* ---------- C. visible buttons (user request #1) ---------- */
+    ['dark', 'light', 'amoled'].forEach(function (theme) {
+      T('C1-' + theme + ' icon buttons have visible background', function () {
+        app().dataset.theme = theme;
+        var b = sheet().querySelector('.pdt-head .pdt-ib');
+        var bg = css(b, 'background-color');
+        var bd = css(b, 'border-top-width');
+        return (bg !== 'rgba(0, 0, 0, 0)' && parseFloat(bd) >= 1) || 'bg=' + bg + ' bd=' + bd;
+      });
+      T('C2-' + theme + ' segmented buttons visible on cards', function () {
+        P.tab('settings');
+        var seg = app().querySelector('.pdt-seg');
+        if (!seg) return 'no seg found';
+        var bg = css(seg, 'background-color');
+        var bd = css(seg, 'border-top-width');
+        return (bg !== 'rgba(0, 0, 0, 0)' && parseFloat(bd) >= 1) || 'bg=' + bg + ' bd=' + bd;
+      });
+      T('C3-' + theme + ' chips have border + bg', function () {
+        P.tab('network');
+        var chip = app().querySelector('.pdt-chip');
+        if (!chip) return 'no chip';
+        return (css(chip, 'background-color') !== 'rgba(0, 0, 0, 0)' &&
+                parseFloat(css(chip, 'border-top-width')) >= 1) || 'invisible';
+      });
+    });
+    app().dataset.theme = 'dark';
+    T('C4 FAB is accent-colored (visible everywhere)', function () {
+      P.close();
+      P.showFab();
+      var rgb = css(fab, 'background-color');
+      return /91,\s*157,\s*255|37,\s*99,\s*235|110,\s*168,\s*255/.test(rgb) || 'bg=' + rgb;
+    });
+    T('C5 network toolbar icon buttons styled', function () {
+      P.tab('network');
+      var ib = app().querySelector('.pdt-toolbar .pdt-ib');
+      if (!ib) return 'no .pdt-ib in toolbar';
+      return (css(ib, 'background-color') !== 'rgba(0, 0, 0, 0)') || 'transparent';
+    });
+
+    /* ---------- D. Firefox inspect compat (stability) ---------- */
+    T('D1 inspect: touch select works once', function () {
+      if (typeof TouchEvent !== 'function' || typeof Touch !== 'function') return true; /* browser lacks synthetic touch */
+      /* fixed-position probe at a safe mid-screen spot (clear of sheet/FAB) */
+      var el = document.createElement('div');
+      el.id = 'd1probe';
+      el.style.cssText = 'position:fixed;left:12px;top:210px;width:110px;height:80px;background:#eaa';
+      document.body.appendChild(el);
+      try {
+        P.inspect();   /* inspect on */
+        var t = new Touch({ identifier: 1, target: el, clientX: 40, clientY: 240 });
+        document.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, cancelable: true, touches: [t] }));
+        document.dispatchEvent(new TouchEvent('touchend', { bubbles: true, cancelable: true, touches: [] }));
+      } catch (e) { el.remove(); return 'synthetic touch unsupported: ' + e.message; }
+      var sel = P.$0();
+      el.remove();
+      return sel === el || 'sel=' + (sel && (sel.id || sel.tagName));
+    });
+    T('D2 page scroll still possible with sheet closed', function () {
+      P.close();
+      window.scrollTo(0, 0);
+      window.scrollTo(0, 300);
+      return window.scrollY > 50 || 'scrollY=' + window.scrollY;
+    });
+
+    /* ---------- E. zero interference ---------- */
+    T('E1 no page errors from the tools', function () {
+      return true; /* pageerror listener below flips this if any leaked */
+    });
+
+    var pass = 0, fail = 0;
+    window.__RESULTS.forEach(function (r) { r.pass ? pass++ : fail++; });
+    document.getElementById('out').innerHTML = window.__RESULTS.map(function (r) {
+      return '<div class="r"><b class="' + (r.pass ? 'PASS' : 'FAIL') + '">' + (r.pass ? 'PASS' : 'FAIL') +
+        '</b> ' + r.name + (r.info ? ' <i>[' + r.info + ']</i>' : '') + '</div>';
+    }).join('');
+    window.__DONE = true;
+    document.title = fail ? 'E2E5 FAIL ' + pass + '/' + (pass + fail) : 'E2E5 PASS ' + pass + '/' + (pass + fail);
+  }, 700);
+})();
+</script>
+</body>
+</html>

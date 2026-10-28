@@ -21,11 +21,11 @@ function h(sel, attrs, kids) {
     for (var k in attrs) {
       var v = attrs[k];
       if (v == null) continue;
-      if (k === 'style' && typeof v === 'object') { for (var sk in v) el.style[sk] = v[sk]; }
-      else if (k.slice(0, 2) === 'on' && typeof v === 'function') el.addEventListener(k.slice(2), v);
-      else if (k === 'dataset') { for (var dk in v) el.dataset[dk] = v[dk]; }
+      if (k === 'style' && typeof v === 'object') { for (var sk in v) { try { el.style[sk] = v[sk]; } catch (e) { /* noop */ } } }
+      else if (k.slice(0, 2) === 'on' && typeof v === 'function') el.addEventListener(k.slice(2), safe(v, 'ui.' + k));
+      else if (k === 'dataset') { for (var dk in v) { try { el.dataset[dk] = v[dk]; } catch (e) { /* noop */ } } }
       else if (k === 'value' || k === 'checked' || k === 'disabled' || k === 'selectedIndex') { try { el[k] = v; } catch (e) { /* noop */ } }
-      else el.setAttribute(k, v);
+      else { try { el.setAttribute(k, v); } catch (e) { /* noop */ } }
     }
   }
   addKids(el, kids);
@@ -145,7 +145,7 @@ function debounce(fn, ms) {
   return function () {
     var a = arguments, self = this;
     clearTimeout(t);
-    t = setTimeout(function () { fn.apply(self, a); }, ms || 150);
+    t = setTimeout(function () { try { fn.apply(self, a); } catch (e) { pdError(e, 'debounce'); } }, ms || 150);
   };
 }
 
@@ -164,7 +164,7 @@ function copyText(text, silent) {
     ta.value = text;
     ta.setAttribute('readonly', '');
     ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
-    document.body.appendChild(ta);
+    (document.body || document.documentElement).appendChild(ta);
     ta.select();
     var ok = false;
     try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
@@ -239,7 +239,7 @@ function serialize(v, depth) {
     if (v === null) return 'null';
     if (v === undefined) return 'undefined';
     var t = typeof v;
-    if (t === 'string') return v;
+    if (t === 'string') return v.length > 10000 ? v.slice(0, 10000) + '… [truncated]' : v;
     if (t === 'number' || t === 'boolean' || t === 'bigint') return String(v);
     if (t === 'function') return 'ƒ ' + (v.name || 'anonymous') + '()';
     if (t === 'symbol') return v.toString();
@@ -282,9 +282,9 @@ function downloadFile(name, content, mime) {
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
     a.href = url; a.download = name;
-    document.body.appendChild(a);
+    (document.body || document.documentElement).appendChild(a);
     a.click();
-    setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 400);
+    setTimeout(function () { try { URL.revokeObjectURL(url); a.remove(); } catch (e) { /* noop */ } }, 400);
     toast('Downloading ' + name);
   } catch (e) { toast('Download failed'); }
 }
@@ -332,12 +332,12 @@ function installConsoleHelpers() {
     if (!el || !el.addEventListener) { toast('monitorEvents(element, [types])'); return; }
     types = types || ['click', 'input', 'change', 'keydown', 'scroll', 'touchstart'];
     types.forEach(function (t) {
-      el.addEventListener(t, function (e) {
+      el.addEventListener(t, safe(function (e) {
         conEmit('info', ['[event] ' + (el.tagName || 'obj') + ' ' + t + ' ' + serialize({
           type: e.type, target: (e.target && e.target.tagName) || '?',
           key: e.key, x: e.clientX, y: e.clientY, value: (e.target && e.target.value || '').slice ? String(e.target.value).slice(0, 80) : undefined
         }, 1)]);
-      }, { passive: true });
+      }, 'monitorEvents'), { passive: true });
     });
     return 'Monitoring ' + types.join(', ') + ' — events print to the console';
   });
@@ -345,35 +345,42 @@ function installConsoleHelpers() {
 }
 
 /* ---------------- lightweight JSON-path pretty print for the object inspector ---------------- */
+/* ---------------- hostile-object-safe kind detection ----------------
+ * Objects logged to the console can be Proxies with throwing traps or
+ * revoked proxies — every access must be guarded so inspecting them can
+ * never throw into the page. */
 function objKind(v) {
   if (v === null) return 'null';
-  if (Array.isArray(v)) return 'array';
   var t = typeof v;
-  if (t === 'object') {
-    if (typeof Element !== 'undefined' && v instanceof Element) return 'element';
-    if (typeof Window !== 'undefined' && v === window) return 'window';
-    if (v instanceof Date) return 'date';
-    if (v instanceof Error) return 'error';
-    if (v instanceof RegExp) return 'regexp';
-    if (typeof Map !== 'undefined' && v instanceof Map) return 'map';
-    if (typeof Set !== 'undefined' && v instanceof Set) return 'set';
-    return 'object';
-  }
-  return t;
+  if (t !== 'object') return t;             /* covers function/symbol/… */
+  try { if (Array.isArray(v)) return 'array'; } catch (e) { return 'opaque'; }
+  function isA(C) { try { return v instanceof C; } catch (e) { return false; } }
+  if (typeof Element !== 'undefined' && isA(Element)) return 'element';
+  if (typeof Window !== 'undefined' && v === window) return 'window';
+  if (isA(Date)) return 'date';
+  if (isA(Error)) return 'error';
+  if (isA(RegExp)) return 'regexp';
+  if (typeof Map !== 'undefined' && isA(Map)) return 'map';
+  if (typeof Set !== 'undefined' && isA(Set)) return 'set';
+  return 'object';
 }
 function objPreview(v) {
-  var k = objKind(v);
-  if (k === 'array') return 'Array(' + v.length + ')';
-  if (k === 'object') {
-    try { return '{' + Object.keys(v).length + ' keys}'; } catch (e) { return '{…}'; }
-  }
-  if (k === 'map') return 'Map(' + v.size + ')';
-  if (k === 'set') return 'Set(' + v.size + ')';
-  return serialize(v, 0);
+  try {
+    var k = objKind(v);
+    if (k === 'array') return 'Array(' + v.length + ')';
+    if (k === 'object') {
+      try { return '{' + Object.keys(v).length + ' keys}'; } catch (e) { return '{…}'; }
+    }
+    if (k === 'map') return 'Map(' + v.size + ')';
+    if (k === 'set') return 'Set(' + v.size + ')';
+    return serialize(v, 0);
+  } catch (e) { return '{…}'; }
 }
 function isExpandable(v) {
-  var k = objKind(v);
-  return k === 'array' || k === 'object' || k === 'map' || k === 'set';
+  try {
+    var k = objKind(v);
+    return k === 'array' || k === 'object' || k === 'map' || k === 'set';
+  } catch (e) { return false; }
 }
 
 /* ---------------- color parsing / contrast (Utils > Color tool) ---------------- */

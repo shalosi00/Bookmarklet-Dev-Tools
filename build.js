@@ -15,7 +15,7 @@ const fs = require('fs');
 const path = require('path');
 
 const SRC = path.join(__dirname, 'src');
-const VERSION = '5.1.0';
+const VERSION = '5.3.0';
 
 const BANNER = '/*! Pocket DevTools v' + VERSION +
   ' | MIT | improved fork of DeveloperExotic/Bookmarklet-Dev-Tools */\n';
